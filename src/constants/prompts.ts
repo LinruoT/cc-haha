@@ -98,9 +98,39 @@ const skillSearchFeatureCheck = feature('EXPERIMENTAL_SKILL_SEARCH')
 /* eslint-enable @typescript-eslint/no-require-imports */
 import type { OutputStyleConfig } from './outputStyles.js'
 import { CYBER_RISK_INSTRUCTION } from './cyberRiskInstruction.js'
+import {
+  buildZhSystemPrompt,
+  getZhIntroSection,
+  getZhSystemSection,
+  getZhDoingTasksSection,
+  getZhActionsSection,
+  getZhUsingToolsSection,
+  getZhToneAndStyleSection,
+  getZhOutputEfficiencySection,
+  getZhAgentToolSection,
+} from './zh-prompts.js'
+import { loadToolExperiencePrompt } from '../memdir/toolExperiences.js'
+import { shouldUseChinese } from '../utils/language.js'
 
 export const CLAUDE_CODE_DOCS_MAP_URL =
   'https://code.claude.com/docs/en/claude_code_docs_map.md'
+
+/**
+ * 判断是否应该使用中文提示词
+ * 基于language设置或环境变量
+ */
+export function shouldUseChinesePrompts(): boolean {
+  const settings = getInitialSettings()
+  // 检查language设置
+  if (settings.language === 'chinese' || settings.language === 'zh' || settings.language === 'zh-CN' || settings.language === '中文') {
+    return true
+  }
+  // 检查环境变量
+  if (isEnvTruthy(process.env.CLAUDE_CODE_CHINESE_PROMPTS)) {
+    return true
+  }
+  return false
+}
 
 /**
  * Boundary marker separating static (cross-org cacheable) content from dynamic content.
@@ -463,6 +493,47 @@ export async function getSystemPrompt(
   const settings = getInitialSettings()
   const enabledTools = new Set(tools.map(_ => _.name))
 
+  // 中文提示词支持
+  if (shouldUseChinesePrompts()) {
+    logForDebugging(`[SystemPrompt] path=chinese-prompts`)
+    
+    // 加载工具经验
+    const toolExperiencePrompt = await loadToolExperiencePrompt(model)
+    
+    // 构建中文系统提示词
+    const zhPrompt = buildZhSystemPrompt({
+      enabledTools,
+      memoryDir: undefined, // 记忆目录会在后续动态加载
+      modelDescription: `你由 ${model} 模型驱动。`,
+      envInfo,
+    })
+
+    // 如果有工具经验，添加到提示词中
+    if (toolExperiencePrompt) {
+      zhPrompt.push(toolExperiencePrompt)
+    }
+
+    // 添加记忆系统提示
+    const memoryPrompt = await loadMemoryPrompt()
+    if (memoryPrompt) {
+      zhPrompt.push(memoryPrompt)
+    }
+
+    // 调试：将中文提示词写入文件以便查看
+    if (isEnvTruthy(process.env.DEBUG_ZH_PROMPT)) {
+      const { writeFileSync, mkdirSync } = await import('fs')
+      const { join } = await import('path')
+      const { getClaudeConfigHomeDir } = await import('../utils/envUtils.js')
+      const debugDir = join(getClaudeConfigHomeDir(), 'debug')
+      mkdirSync(debugDir, { recursive: true })
+      const debugFile = join(debugDir, 'zh-system-prompt.txt')
+      writeFileSync(debugFile, zhPrompt.join('\n\n---\n\n'), 'utf-8')
+      logForDebugging(`[SystemPrompt] Chinese prompt written to: ${debugFile}`)
+    }
+
+    return zhPrompt
+  }
+
   if (
     (feature('PROACTIVE') || feature('KAIROS')) &&
     proactiveModule?.isProactiveActive()
@@ -596,6 +667,14 @@ ${client.instructions}`
     })
     .join('\n\n')
 
+  if (shouldUseChinese()) {
+    return `# MCP服务器指令
+
+以下MCP服务器提供了关于如何使用其工具和资源的指令：
+
+${instructionBlocks}`
+  }
+
   return `# MCP Server Instructions
 
 The following MCP servers have provided instructions for how to use their tools and resources:
@@ -668,45 +747,85 @@ export async function computeSimpleEnvInfo(
 
   const cutoff = getKnowledgeCutoff(modelId)
   const knowledgeCutoffMessage = cutoff
-    ? `Assistant knowledge cutoff is ${cutoff}.`
+    ? shouldUseChinese()
+      ? `模型知识截止日期: ${cutoff}。`
+      : `Assistant knowledge cutoff is ${cutoff}.`
     : null
 
   const cwd = getCwd()
   const isWorktree = getCurrentWorktreeSession() !== null
 
-  const envItems = [
-    `Primary working directory: ${cwd}`,
-    isWorktree
-      ? `This is a git worktree — an isolated copy of the repository. Run all commands from this directory. Do NOT \`cd\` to the original repository root.`
-      : null,
-    [`Is a git repository: ${isGit}`],
-    additionalWorkingDirectories && additionalWorkingDirectories.length > 0
-      ? `Additional working directories:`
-      : null,
-    additionalWorkingDirectories && additionalWorkingDirectories.length > 0
-      ? additionalWorkingDirectories
-      : null,
-    `Platform: ${env.platform}`,
-    getShellInfoLine(),
-    `OS Version: ${unameSR}`,
-    modelDescription,
-    knowledgeCutoffMessage,
-    process.env.USER_TYPE === 'ant' && isUndercover()
-      ? null
-      : `The most recent Claude model family is Claude 4.5/4.6. Model IDs — Opus 4.7: '${CLAUDE_4_5_OR_4_6_MODEL_IDS.opus}', Sonnet 4.6: '${CLAUDE_4_5_OR_4_6_MODEL_IDS.sonnet}', Haiku 4.5: '${CLAUDE_4_5_OR_4_6_MODEL_IDS.haiku}'. When building AI applications, default to the latest and most capable Claude models.`,
-    process.env.USER_TYPE === 'ant' && isUndercover()
-      ? null
-      : `Claude Code is available as a CLI in the terminal, desktop app (Mac/Windows), web app (claude.ai/code), and IDE extensions (VS Code, JetBrains).`,
-    process.env.USER_TYPE === 'ant' && isUndercover()
-      ? null
-      : `Fast mode for Claude Code uses the same ${FRONTIER_MODEL_NAME} model with faster output. It does NOT switch to a different model. It can be toggled with /fast.`,
-  ].filter(item => item !== null)
+  const isZh = shouldUseChinese()
 
-  return [
-    `# Environment`,
-    `You have been invoked in the following environment: `,
-    ...prependBullets(envItems),
-  ].join(`\n`)
+  const envItems = isZh
+    ? [
+        `主工作目录: ${cwd}`,
+        isWorktree
+          ? `这是一个git工作树——仓库的隔离副本。所有命令都从这个目录运行。不要\`cd\`到原始仓库根目录。`
+          : null,
+        [`是否为git仓库: ${isGit ? '是' : '否'}`],
+        additionalWorkingDirectories && additionalWorkingDirectories.length > 0
+          ? `额外工作目录:`
+          : null,
+        additionalWorkingDirectories && additionalWorkingDirectories.length > 0
+          ? additionalWorkingDirectories
+          : null,
+        `平台: ${env.platform}`,
+        `Shell: ${getShellInfoLine()}`,
+        `操作系统版本: ${unameSR}`,
+        modelDescription ? `你由 ${modelDescription} 模型驱动。` : null,
+        knowledgeCutoffMessage,
+        process.env.USER_TYPE === 'ant' && isUndercover()
+          ? null
+          : `最新的Claude模型系列是Claude 4.5/4.6。模型ID — Opus 4.7: '${CLAUDE_4_5_OR_4_6_MODEL_IDS.opus}', Sonnet 4.6: '${CLAUDE_4_5_OR_4_6_MODEL_IDS.sonnet}', Haiku 4.5: '${CLAUDE_4_5_OR_4_6_MODEL_IDS.haiku}'。构建AI应用时，默认使用最新、最强大的Claude模型。`,
+        process.env.USER_TYPE === 'ant' && isUndercover()
+          ? null
+          : `Claude Code可在终端CLI、桌面应用（Mac/Windows）、Web应用（claude.ai/code）和IDE扩展（VS Code、JetBrains）中使用。`,
+        process.env.USER_TYPE === 'ant' && isUndercover()
+          ? null
+          : `Claude Code的快速模式使用相同的${FRONTIER_MODEL_NAME}模型，但输出更快。它不会切换到不同的模型。可以通过 /fast 切换。`,
+      ].filter(item => item !== null)
+    : [
+        `Primary working directory: ${cwd}`,
+        isWorktree
+          ? `This is a git worktree — an isolated copy of the repository. Run all commands from this directory. Do NOT \`cd\` to the original repository root.`
+          : null,
+        [`Is a git repository: ${isGit}`],
+        additionalWorkingDirectories && additionalWorkingDirectories.length > 0
+          ? `Additional working directories:`
+          : null,
+        additionalWorkingDirectories && additionalWorkingDirectories.length > 0
+          ? additionalWorkingDirectories
+          : null,
+        `Platform: ${env.platform}`,
+        `Shell: ${getShellInfoLine()}`,
+        `OS Version: ${unameSR}`,
+        modelDescription
+          ? `You are powered by the model named ${modelDescription}. The exact model ID is ${modelId}.`
+          : null,
+        knowledgeCutoffMessage,
+        process.env.USER_TYPE === 'ant' && isUndercover()
+          ? null
+          : `The most recent Claude model family is Claude 4.5/4.6. Model IDs — Opus 4.7: '${CLAUDE_4_5_OR_4_6_MODEL_IDS.opus}', Sonnet 4.6: '${CLAUDE_4_5_OR_4_6_MODEL_IDS.sonnet}', Haiku 4.5: '${CLAUDE_4_5_OR_4_6_MODEL_IDS.haiku}'. When building AI applications, default to the latest and most capable Claude models.`,
+        process.env.USER_TYPE === 'ant' && isUndercover()
+          ? null
+          : `Claude Code is available as a CLI in the terminal, desktop app (Mac/Windows), web app (claude.ai/code), and IDE extensions (VS Code, JetBrains).`,
+        process.env.USER_TYPE === 'ant' && isUndercover()
+          ? null
+          : `Fast mode for Claude Code uses the same ${FRONTIER_MODEL_NAME} model with faster output. It does NOT switch to a different model. It can be toggled with /fast.`,
+      ].filter(item => item !== null)
+
+  return isZh
+    ? [
+        `# 环境信息`,
+        `你在以下环境中被调用：`,
+        ...prependBullets(envItems),
+      ].join(`\n`)
+    : [
+        `# Environment`,
+        `You have been invoked in the following environment: `,
+        ...prependBullets(envItems),
+      ].join(`\n`)
 }
 
 // @[MODEL LAUNCH]: Add a knowledge cutoff date for the new model.
@@ -755,7 +874,9 @@ export function getUnameSR(): string {
   return `${osType()} ${osRelease()}`
 }
 
-export const DEFAULT_AGENT_PROMPT = `You are an agent for Claude Code, Anthropic's official CLI for Claude. Given the user's message, you should use the tools available to complete the task. Complete the task fully—don't gold-plate, but don't leave it half-done. When you complete the task, respond with a concise report covering what was done and any key findings — the caller will relay this to the user, so it only needs the essentials.`
+export const DEFAULT_AGENT_PROMPT = shouldUseChinese()
+  ? `你是Claude Code的Agent，Anthropic官方的Claude CLI。根据用户的消息，你应该使用可用的工具来完成任务。完整地完成任务——不要过度设计，但也不要半途而废。完成任务后，用简洁的报告回复所做的事情和任何关键发现——调用者会将此传达给用户，所以只需要要点。`
+  : `You are an agent for Claude Code, Anthropic's official CLI for Claude. Given the user's message, you should use the tools available to complete the task. Complete the task fully—don't gold-plate, but don't leave it half-done. When you complete the task, respond with a concise report covering what was done and any key findings — the caller will relay this to the user, so it only needs the essentials.`
 
 export async function enhanceSystemPromptWithEnvDetails(
   existingSystemPrompt: string[],
@@ -763,7 +884,13 @@ export async function enhanceSystemPromptWithEnvDetails(
   additionalWorkingDirectories?: string[],
   enabledToolNames?: ReadonlySet<string>,
 ): Promise<string[]> {
-  const notes = `Notes:
+  const notes = shouldUseChinese()
+    ? `注意事项：
+- Agent线程在bash调用之间总是重置其cwd，因此请只使用绝对文件路径。
+- 在你的最终回复中，分享与任务相关的文件路径（始终是绝对路径，不要相对路径）。只在精确文本至关重要时才包含代码片段（例如，你发现的bug、调用者要求的函数签名）——不要重复你只是读过的代码。
+- 为了与用户清晰沟通，助手必须避免使用表情符号。
+- 在工具调用之前不要使用冒号。像"让我读取文件："后跟一个读取工具调用应该只是"让我读取文件。"带句号。`
+    : `Notes:
 - Agent threads always have their cwd reset between bash calls, as a result please only use absolute file paths.
 - In your final response, share file paths (always absolute, never relative) that are relevant to the task. Include code snippets only when the exact text is load-bearing (e.g., a bug you found, a function signature the caller asked for) — do not recap code you merely read.
 - For clear communication with the user the assistant MUST avoid using emojis.
@@ -801,6 +928,24 @@ export function getScratchpadInstructions(): string | null {
 
   const scratchpadDir = getScratchpadDir()
 
+  if (shouldUseChinese()) {
+    return `# 草稿纸目录
+
+重要：始终使用此草稿纸目录存储临时文件，而不是 \`/tmp\` 或其他系统临时目录：
+\`${scratchpadDir}\`
+
+将此目录用于所有临时文件需求：
+- 在多步骤任务中存储中间结果或数据
+- 编写临时脚本或配置文件
+- 保存不属于用户项目的输出
+- 在分析或处理过程中创建工作文件
+- 任何原本会放到 \`/tmp\` 的文件
+
+只有在用户明确请求时才使用 \`/tmp\`。
+
+草稿纸目录是会话特定的，与用户项目隔离，可以自由使用而无需权限提示。`
+  }
+
   return `# Scratchpad Directory
 
 IMPORTANT: Always use this scratchpad directory for temporary files instead of \`/tmp\` or other system temp directories:
@@ -833,12 +978,21 @@ function getFunctionResultClearingSection(model: string): string | null {
   ) {
     return null
   }
+  
+  if (shouldUseChinese()) {
+    return `# 函数结果清理
+
+旧的工具结果将自动从上下文中清除以释放空间。最近的 ${config.keepRecent} 个结果始终保留。`
+  }
+
   return `# Function Result Clearing
 
 Old tool results will be automatically cleared from context to free up space. The ${config.keepRecent} most recent results are always kept.`
 }
 
-const SUMMARIZE_TOOL_RESULTS_SECTION = `When working with tool results, write down any important information you might need later in your response, as the original tool result may be cleared later.`
+const SUMMARIZE_TOOL_RESULTS_SECTION = shouldUseChinese()
+  ? `处理工具结果时，将你以后可能需要的任何重要信息写入你的回复中，因为原始工具结果可能稍后会被清除。`
+  : `When working with tool results, write down any important information you might need later in your response, as the original tool result may be cleared later.`
 
 function getBriefSection(): string | null {
   if (!(feature('KAIROS') || feature('KAIROS_BRIEF'))) return null

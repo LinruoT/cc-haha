@@ -16,6 +16,7 @@ import { execFileNoThrow } from './utils/execFileNoThrow.js'
 import { getBranch, getDefaultBranch, getIsGit, gitExe } from './utils/git.js'
 import { shouldIncludeGitInstructions } from './utils/gitSettings.js'
 import { logError } from './utils/log.js'
+import { shouldUseChinese } from './utils/language.js'
 
 const MAX_STATUS_CHARS = 2000
 
@@ -85,13 +86,26 @@ export const getGitStatus = memoize(async (): Promise<string | null> => {
     const truncatedStatus =
       status.length > MAX_STATUS_CHARS
         ? status.substring(0, MAX_STATUS_CHARS) +
-          '\n... (truncated because it exceeds 2k characters. If you need more information, run "git status" using BashTool)'
+          (shouldUseChinese()
+            ? '\n...（已截断，因为超过2k字符。如需更多信息，请使用BashTool运行 "git status"）'
+            : '\n... (truncated because it exceeds 2k characters. If you need more information, run "git status" using BashTool)')
         : status
 
     logForDiagnosticsNoPII('info', 'git_status_completed', {
       duration_ms: Date.now() - startTime,
       truncated: status.length > MAX_STATUS_CHARS,
     })
+
+    if (shouldUseChinese()) {
+      return [
+        `这是对话开始时的git状态。请注意，此状态是时间点的快照，在对话过程中不会更新。`,
+        `当前分支: ${branch}`,
+        `主分支（通常用于PR）: ${mainBranch}`,
+        ...(userName ? [`Git用户: ${userName}`] : []),
+        `状态:\n${truncatedStatus || '（干净）'}`,
+        `最近提交:\n${log}`,
+      ].join('\n\n')
+    }
 
     return [
       `This is the git status at the start of the conversation. Note that this status is a snapshot in time, and will not update during the conversation.`,
@@ -183,7 +197,9 @@ export const getUserContext = memoize(
 
     return {
       ...(claudeMd && { claudeMd }),
-      currentDate: `Today's date is ${getLocalISODate()}.`,
+      currentDate: shouldUseChinese()
+        ? `今天是 ${getLocalISODate()}。`
+        : `Today's date is ${getLocalISODate()}.`,
     }
   },
 )

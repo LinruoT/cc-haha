@@ -42,7 +42,7 @@ import type { PermissionDecision } from '../../utils/permissions/PermissionResul
 import { matchWildcardPattern } from '../../utils/permissions/shellRuleMatching.js'
 import { FILE_UNEXPECTEDLY_MODIFIED_ERROR } from '../FileEditTool/constants.js'
 import { gitDiffSchema, hunkSchema } from '../FileEditTool/types.js'
-import { FILE_WRITE_TOOL_NAME, getWriteToolDescription } from './prompt.js'
+import { DESCRIPTION, FILE_WRITE_TOOL_NAME, getWriteToolDescription } from './prompt.js'
 import {
   getToolUseSummary,
   isResultTruncated,
@@ -97,7 +97,7 @@ export const FileWriteTool = buildTool({
   maxResultSizeChars: 100_000,
   strict: true,
   async description() {
-    return 'Write a file to the local filesystem.'
+    return DESCRIPTION
   },
   userFacingName,
   getToolUseSummary,

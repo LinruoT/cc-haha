@@ -1667,6 +1667,11 @@ export async function bashToolHasPermission(
 ): Promise<PermissionResult> {
   let appState = context.getAppState()
 
+  // 降级风险检测：检查是否在FileEditTool失败后尝试使用sed/python等命令修改代码
+  const sessionId = context.agentId || 'default'
+  const { detectDowngradeRisk, formatDowngradeRiskWarning } = await import('../../utils/downgradeRisk.js')
+  const downgradeRisk = detectDowngradeRisk(sessionId, input.command, context)
+
   // 0. AST-based security parse. This replaces both tryParseShellCommand
   // (the shell-quote pre-check) and the bashCommandIsSafe misparsing gate.
   // tree-sitter produces either a clean SimpleCommand[] (quotes resolved,
@@ -2369,7 +2374,7 @@ export async function bashToolHasPermission(
     subcommandPermissionDecisions.every(_ => _.behavior === 'allow') &&
     !hasPossibleCommandInjection
   ) {
-    return {
+    const result: PermissionResult = {
       behavior: 'allow',
       updatedInput: input,
       decisionReason: {
@@ -2382,6 +2387,16 @@ export async function bashToolHasPermission(
         ),
       },
     }
+    
+    // 如果检测到降级风险，添加警告消息
+    if (downgradeRisk.hasRisk) {
+      const warningMessage = formatDowngradeRiskWarning(downgradeRisk)
+      if (warningMessage) {
+        result.message = warningMessage
+      }
+    }
+    
+    return result
   }
 
   // Query Haiku for command prefixes
@@ -2459,7 +2474,7 @@ export async function bashToolHasPermission(
     })
   ) {
     // Keep subcommandResults as PermissionResult for decisionReason
-    return {
+    const result: PermissionResult = {
       behavior: 'allow',
       updatedInput: input,
       decisionReason: {
@@ -2467,6 +2482,16 @@ export async function bashToolHasPermission(
         reasons: subcommandResults,
       },
     }
+    
+    // 如果检测到降级风险，添加警告消息
+    if (downgradeRisk.hasRisk) {
+      const warningMessage = formatDowngradeRiskWarning(downgradeRisk)
+      if (warningMessage) {
+        result.message = warningMessage
+      }
+    }
+    
+    return result
   }
 
   // Otherwise, ask for permission

@@ -2,6 +2,7 @@ import { feature } from 'bun:bundle'
 import { join } from 'path'
 import { getFsImplementation } from '../utils/fsOperations.js'
 import { getAutoMemPath, isAutoMemoryEnabled } from './paths.js'
+import { shouldUseChinese } from '../utils/language.js'
 
 /* eslint-disable @typescript-eslint/no-require-imports */
 const teamMemPaths = feature('TEAMMEM')
@@ -113,10 +114,12 @@ const teamMemPrompts = feature('TEAMMEM')
  * Shipped because Claude was burning turns on `ls`/`mkdir -p` before writing.
  * Harness guarantees the directory exists via ensureMemoryDirExists().
  */
-export const DIR_EXISTS_GUIDANCE =
-  'This directory already exists — write to it directly with the Write tool (do not run mkdir or check for its existence).'
-export const DIRS_EXIST_GUIDANCE =
-  'Both directories already exist — write to them directly with the Write tool (do not run mkdir or check for their existence).'
+export const DIR_EXISTS_GUIDANCE = shouldUseChinese()
+  ? '此目录已存在——直接使用Write工具写入（不要运行mkdir或检查其是否存在）。'
+  : 'This directory already exists — write to it directly with the Write tool (do not run mkdir or check for its existence).'
+export const DIRS_EXIST_GUIDANCE = shouldUseChinese()
+  ? '两个目录都已存在——直接使用Write工具写入（不要运行mkdir或检查其是否存在）。'
+  : 'Both directories already exist — write to them directly with the Write tool (do not run mkdir or check for their existence).'
 
 /**
  * Ensure a memory directory exists. Idempotent — called from loadMemoryPrompt
@@ -202,63 +205,123 @@ export function buildMemoryLines(
   extraGuidelines?: string[],
   skipIndex = false,
 ): string[] {
+  const isZh = shouldUseChinese()
+  
   const howToSave = skipIndex
+    ? isZh
+      ? [
+          '## 如何保存记忆',
+          '',
+          '使用以下frontmatter格式将每条记忆写入自己的文件（例如 `user_role.md`、`feedback_testing.md`）：',
+          '',
+          ...MEMORY_FRONTMATTER_EXAMPLE,
+          '',
+          '- 保持记忆文件中的name、description和type字段与内容同步更新',
+          '- 按主题而非时间顺序组织语义化记忆',
+          '- 更新或删除被证明错误或过时的记忆',
+          '- 不要写重复的记忆。在写新记忆之前检查是否有现有记忆可以更新。',
+        ]
+      : [
+          '## How to save memories',
+          '',
+          'Write each memory to its own file (e.g., `user_role.md`, `feedback_testing.md`) using this frontmatter format:',
+          '',
+          ...MEMORY_FRONTMATTER_EXAMPLE,
+          '',
+          '- Keep the name, description, and type fields in memory files up-to-date with the content',
+          '- Organize memory semantically by topic, not chronologically',
+          '- Update or remove memories that turn out to be wrong or outdated',
+          '- Do not write duplicate memories. First check if there is an existing memory you can update before writing a new one.',
+        ]
+    : isZh
+      ? [
+          '## 如何保存记忆',
+          '',
+          '保存记忆是一个两步过程：',
+          '',
+          '**第一步** — 使用以下frontmatter格式将记忆写入自己的文件（例如 `user_role.md`、`feedback_testing.md`）：',
+          '',
+          ...MEMORY_FRONTMATTER_EXAMPLE,
+          '',
+          `**第二步** — 在 \`${ENTRYPOINT_NAME}\` 中添加指向该文件的指针。\`${ENTRYPOINT_NAME}\` 是索引，不是记忆——每个条目应该是一行，不超过约150个字符：\`- [标题](file.md) — 一行钩子\`。它没有frontmatter。永远不要将记忆内容直接写入 \`${ENTRYPOINT_NAME}\`。`,
+          '',
+          `- \`${ENTRYPOINT_NAME}\` 总是加载到你的对话上下文中——超过 ${MAX_ENTRYPOINT_LINES} 行的内容将被截断，所以保持索引简洁`,
+          '- 保持记忆文件中的name、description和type字段与内容同步更新',
+          '- 按主题而非时间顺序组织语义化记忆',
+          '- 更新或删除被证明错误或过时的记忆',
+          '- 不要写重复的记忆。在写新记忆之前检查是否有现有记忆可以更新。',
+        ]
+      : [
+          '## How to save memories',
+          '',
+          'Saving a memory is a two-step process:',
+          '',
+          '**Step 1** — write the memory to its own file (e.g., `user_role.md`, `feedback_testing.md`) using this frontmatter format:',
+          '',
+          ...MEMORY_FRONTMATTER_EXAMPLE,
+          '',
+          `**Step 2** — add a pointer to that file in \`${ENTRYPOINT_NAME}\`. \`${ENTRYPOINT_NAME}\` is an index, not a memory — each entry should be one line, under ~150 characters: \`- [Title](file.md) — one-line hook\`. It has no frontmatter. Never write memory content directly into \`${ENTRYPOINT_NAME}\`.`,
+          '',
+          `- \`${ENTRYPOINT_NAME}\` is always loaded into your conversation context — lines after ${MAX_ENTRYPOINT_LINES} will be truncated, so keep the index concise`,
+          '- Keep the name, description, and type fields in memory files up-to-date with the content',
+          '- Organize memory semantically by topic, not chronologically',
+          '- Update or remove memories that turn out to be wrong or outdated',
+          '- Do not write duplicate memories. First check if there is an existing memory you can update before writing a new one.',
+        ]
+
+  const lines: string[] = isZh
     ? [
-        '## How to save memories',
+        `# ${displayName}`,
         '',
-        'Write each memory to its own file (e.g., `user_role.md`, `feedback_testing.md`) using this frontmatter format:',
+        `你有一个持久的、基于文件的记忆系统，位于 \`${memoryDir}\`。${DIR_EXISTS_GUIDANCE}`,
         '',
-        ...MEMORY_FRONTMATTER_EXAMPLE,
+        '你应该随着时间的推移建立这个记忆系统，以便未来的对话可以完整了解用户是谁、他们希望如何与你协作、要避免或重复哪些行为，以及用户工作的背景。',
         '',
-        '- Keep the name, description, and type fields in memory files up-to-date with the content',
-        '- Organize memory semantically by topic, not chronologically',
-        '- Update or remove memories that turn out to be wrong or outdated',
-        '- Do not write duplicate memories. First check if there is an existing memory you can update before writing a new one.',
+        '如果用户明确要求你记住某些东西，请立即保存为最合适的类型。如果他们要求你忘记某些东西，请找到并删除相关条目。',
+        '',
+        ...TYPES_SECTION_INDIVIDUAL,
+        ...WHAT_NOT_TO_SAVE_SECTION,
+        '',
+        ...howToSave,
+        '',
+        ...WHEN_TO_ACCESS_SECTION,
+        '',
+        ...TRUSTING_RECALL_SECTION,
+        '',
+        '## 记忆和其他形式的持久化',
+        '记忆是你在协助用户进行特定对话时可用的几种持久化机制之一。区别在于记忆可以在未来的对话中被回忆，不应该用于持久化仅在当前对话范围内有用的信息。',
+        '- 何时使用或更新计划而不是记忆：如果你即将开始一个非平凡的实现任务，并希望与用户就你的方法达成一致，你应该使用计划而不是将这些信息保存到记忆中。类似地，如果你在对话中已经有了计划并且改变了你的方法，通过更新计划而不是保存记忆来持久化这个变化。',
+        '- 何时使用或更新任务而不是记忆：当你需要将当前对话中的工作分解为离散步骤或跟踪进度时，使用任务而不是保存到记忆。任务非常适合持久化当前对话中需要完成的工作信息，但记忆应该保留给对未来对话有用的信息。',
+        '',
+        ...(extraGuidelines ?? []),
+        '',
       ]
     : [
-        '## How to save memories',
+        `# ${displayName}`,
         '',
-        'Saving a memory is a two-step process:',
+        `You have a persistent, file-based memory system at \`${memoryDir}\`. ${DIR_EXISTS_GUIDANCE}`,
         '',
-        '**Step 1** — write the memory to its own file (e.g., `user_role.md`, `feedback_testing.md`) using this frontmatter format:',
+        "You should build up this memory system over time so that future conversations can have a complete picture of who the user is, how they'd like to collaborate with you, what behaviors to avoid or repeat, and the context behind the work the user gives you.",
         '',
-        ...MEMORY_FRONTMATTER_EXAMPLE,
+        'If the user explicitly asks you to remember something, save it immediately as whichever type fits best. If they ask you to forget something, find and remove the relevant entry.',
         '',
-        `**Step 2** — add a pointer to that file in \`${ENTRYPOINT_NAME}\`. \`${ENTRYPOINT_NAME}\` is an index, not a memory — each entry should be one line, under ~150 characters: \`- [Title](file.md) — one-line hook\`. It has no frontmatter. Never write memory content directly into \`${ENTRYPOINT_NAME}\`.`,
+        ...TYPES_SECTION_INDIVIDUAL,
+        ...WHAT_NOT_TO_SAVE_SECTION,
         '',
-        `- \`${ENTRYPOINT_NAME}\` is always loaded into your conversation context — lines after ${MAX_ENTRYPOINT_LINES} will be truncated, so keep the index concise`,
-        '- Keep the name, description, and type fields in memory files up-to-date with the content',
-        '- Organize memory semantically by topic, not chronologically',
-        '- Update or remove memories that turn out to be wrong or outdated',
-        '- Do not write duplicate memories. First check if there is an existing memory you can update before writing a new one.',
+        ...howToSave,
+        '',
+        ...WHEN_TO_ACCESS_SECTION,
+        '',
+        ...TRUSTING_RECALL_SECTION,
+        '',
+        '## Memory and other forms of persistence',
+        'Memory is one of several persistence mechanisms available to you as you assist the user in a given conversation. The distinction is often that memory can be recalled in future conversations and should not be used for persisting information that is only useful within the scope of the current conversation.',
+        '- When to use or update a plan instead of memory: If you are about to start a non-trivial implementation task and would like to reach alignment with the user on your approach you should use a Plan rather than saving this information to memory. Similarly, if you already have a plan within the conversation and you have changed your approach persist that change by updating the plan rather than saving a memory.',
+        '- When to use or update tasks instead of memory: When you need to break your work in current conversation into discrete steps or keep track of your progress use tasks instead of saving to memory. Tasks are great for persisting information about the work that needs to be done in the current conversation, but memory should be reserved for information that will be useful in future conversations.',
+        '',
+        ...(extraGuidelines ?? []),
+        '',
       ]
-
-  const lines: string[] = [
-    `# ${displayName}`,
-    '',
-    `You have a persistent, file-based memory system at \`${memoryDir}\`. ${DIR_EXISTS_GUIDANCE}`,
-    '',
-    "You should build up this memory system over time so that future conversations can have a complete picture of who the user is, how they'd like to collaborate with you, what behaviors to avoid or repeat, and the context behind the work the user gives you.",
-    '',
-    'If the user explicitly asks you to remember something, save it immediately as whichever type fits best. If they ask you to forget something, find and remove the relevant entry.',
-    '',
-    ...TYPES_SECTION_INDIVIDUAL,
-    ...WHAT_NOT_TO_SAVE_SECTION,
-    '',
-    ...howToSave,
-    '',
-    ...WHEN_TO_ACCESS_SECTION,
-    '',
-    ...TRUSTING_RECALL_SECTION,
-    '',
-    '## Memory and other forms of persistence',
-    'Memory is one of several persistence mechanisms available to you as you assist the user in a given conversation. The distinction is often that memory can be recalled in future conversations and should not be used for persisting information that is only useful within the scope of the current conversation.',
-    '- When to use or update a plan instead of memory: If you are about to start a non-trivial implementation task and would like to reach alignment with the user on your approach you should use a Plan rather than saving this information to memory. Similarly, if you already have a plan within the conversation and you have changed your approach persist that change by updating the plan rather than saving a memory.',
-    '- When to use or update tasks instead of memory: When you need to break your work in current conversation into discrete steps or keep track of your progress use tasks instead of saving to memory. Tasks are great for persisting information about the work that needs to be done in the current conversation, but memory should be reserved for information that will be useful in future conversations.',
-    '',
-    ...(extraGuidelines ?? []),
-    '',
-  ]
 
   lines.push(...buildSearchingPastContextSection(memoryDir))
 
@@ -389,6 +452,25 @@ export function buildSearchingPastContextSection(autoMemDir: string): string[] {
   const transcriptSearch = embedded
     ? `grep -rn "<search term>" ${projectDir}/ --include="*.jsonl"`
     : `${GREP_TOOL_NAME} with pattern="<search term>" path="${projectDir}/" glob="*.jsonl"`
+  
+  if (shouldUseChinese()) {
+    return [
+      '## 搜索过去的上下文',
+      '',
+      '当寻找过去的上下文时：',
+      '1. 搜索记忆目录中的主题文件：',
+      '```',
+      memSearch,
+      '```',
+      '2. 会话转录日志（最后手段——大文件，慢）：',
+      '```',
+      transcriptSearch,
+      '```',
+      '使用窄搜索词（错误消息、文件路径、函数名）而不是宽泛的关键词。',
+      '',
+    ]
+  }
+  
   return [
     '## Searching past context',
     '',

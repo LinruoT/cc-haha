@@ -11,6 +11,17 @@
  * trivial without reasoning through a helper's conditional rendering.
  */
 
+import { shouldUseChinese } from '../utils/language.js'
+import {
+  ZH_TYPES_SECTION_COMBINED,
+  ZH_TYPES_SECTION_INDIVIDUAL,
+  ZH_WHAT_NOT_TO_SAVE_SECTION,
+  ZH_MEMORY_DRIFT_CAVEAT,
+  ZH_WHEN_TO_ACCESS_SECTION,
+  ZH_TRUSTING_RECALL_SECTION,
+  ZH_MEMORY_FRONTMATTER_EXAMPLE,
+} from './memoryTypesZh.js'
+
 export const MEMORY_TYPES = [
   'user',
   'feedback',
@@ -31,10 +42,10 @@ export function parseMemoryType(raw: unknown): MemoryType | undefined {
 }
 
 /**
- * `## Types of memory` section for COMBINED mode (private + team directories).
+ * English version of `## Types of memory` section for COMBINED mode (private + team directories).
  * Includes <scope> tags and team/private qualifiers in examples.
  */
-export const TYPES_SECTION_COMBINED: readonly string[] = [
+const EN_TYPES_SECTION_COMBINED: readonly string[] = [
   '## Types of memory',
   '',
   'There are several discrete types of memory that you can store in your memory system. Each type below declares a <scope> of `private`, `team`, or guidance for choosing between the two.',
@@ -106,11 +117,17 @@ export const TYPES_SECTION_COMBINED: readonly string[] = [
 ]
 
 /**
- * `## Types of memory` section for INDIVIDUAL-ONLY mode (single directory).
- * No <scope> tags. Examples use plain `[saves X memory: …]`. Prose that
- * only makes sense with a private/team split is reworded.
+ * `## Types of memory` section for COMBINED mode (private + team directories).
+ * Includes <scope> tags and team/private qualifiers in examples.
  */
-export const TYPES_SECTION_INDIVIDUAL: readonly string[] = [
+export const TYPES_SECTION_COMBINED: readonly string[] = shouldUseChinese()
+  ? ZH_TYPES_SECTION_COMBINED
+  : EN_TYPES_SECTION_COMBINED
+
+/**
+ * English version of `## Types of memory` section for INDIVIDUAL-ONLY mode.
+ */
+const EN_TYPES_SECTION_INDIVIDUAL: readonly string[] = [
   '## Types of memory',
   '',
   'There are several discrete types of memory that you can store in your memory system:',
@@ -178,9 +195,18 @@ export const TYPES_SECTION_INDIVIDUAL: readonly string[] = [
 ]
 
 /**
- * `## What NOT to save in memory` section. Identical across both modes.
+ * `## Types of memory` section for INDIVIDUAL-ONLY mode (single directory).
+ * No <scope> tags. Examples use plain `[saves X memory: …]`. Prose that
+ * only makes sense with a private/team split is reworded.
  */
-export const WHAT_NOT_TO_SAVE_SECTION: readonly string[] = [
+export const TYPES_SECTION_INDIVIDUAL: readonly string[] = shouldUseChinese()
+  ? ZH_TYPES_SECTION_INDIVIDUAL
+  : EN_TYPES_SECTION_INDIVIDUAL
+
+/**
+ * English version of `## What NOT to save in memory` section.
+ */
+const EN_WHAT_NOT_TO_SAVE_SECTION: readonly string[] = [
   '## What NOT to save in memory',
   '',
   '- Code patterns, conventions, architecture, file paths, or project structure — these can be derived by reading the current project state.',
@@ -189,59 +215,52 @@ export const WHAT_NOT_TO_SAVE_SECTION: readonly string[] = [
   '- Anything already documented in CLAUDE.md files.',
   '- Ephemeral task details: in-progress work, temporary state, current conversation context.',
   '',
-  // H2: explicit-save gate. Eval-validated (memory-prompt-iteration case 3,
-  // 0/2 → 3/3): prevents "save this week's PR list" → activity-log noise.
   'These exclusions apply even when the user explicitly asks you to save. If they ask you to save a PR list or activity summary, ask what was *surprising* or *non-obvious* about it — that is the part worth keeping.',
 ]
+
+/**
+ * `## What NOT to save in memory` section. Identical across both modes.
+ */
+export const WHAT_NOT_TO_SAVE_SECTION: readonly string[] = shouldUseChinese()
+  ? ZH_WHAT_NOT_TO_SAVE_SECTION
+  : EN_WHAT_NOT_TO_SAVE_SECTION
+
+/**
+ * English version of memory drift caveat.
+ */
+const EN_MEMORY_DRIFT_CAVEAT =
+  '- Memory records can become stale over time. Use memory as context for what was true at a given point in time. Before answering the user or building assumptions based solely on information in memory records, verify that the memory is still correct and up-to-date by reading the current state of the files or resources. If a recalled memory conflicts with current information, trust what you observe now — and update or remove the stale memory rather than acting on it.'
 
 /**
  * Recall-side drift caveat. Single bullet under `## When to access memories`.
  * Proactive: verify memory against current state before answering.
  */
-export const MEMORY_DRIFT_CAVEAT =
-  '- Memory records can become stale over time. Use memory as context for what was true at a given point in time. Before answering the user or building assumptions based solely on information in memory records, verify that the memory is still correct and up-to-date by reading the current state of the files or resources. If a recalled memory conflicts with current information, trust what you observe now — and update or remove the stale memory rather than acting on it.'
+export const MEMORY_DRIFT_CAVEAT = shouldUseChinese()
+  ? ZH_MEMORY_DRIFT_CAVEAT
+  : EN_MEMORY_DRIFT_CAVEAT
 
 /**
- * `## When to access memories` section. Includes MEMORY_DRIFT_CAVEAT.
- *
- * H6 (branch-pollution evals #22856, case 5 1/3 on capy): the "ignore" bullet
- * is the delta. Failure mode: user says "ignore memory about X" → Claude reads
- * code correctly but adds "not Y as noted in memory" — treats "ignore" as
- * "acknowledge then override" rather than "don't reference at all." The bullet
- * names that anti-pattern explicitly.
- *
- * Token budget (H6a): merged old bullets 1+2, tightened both. Old 4 lines
- * were ~70 tokens; new 4 lines are ~73 tokens. Net ~+3.
+ * English version of `## When to access memories` section.
  */
-export const WHEN_TO_ACCESS_SECTION: readonly string[] = [
+const EN_WHEN_TO_ACCESS_SECTION: readonly string[] = [
   '## When to access memories',
   '- When memories seem relevant, or the user references prior-conversation work.',
   '- You MUST access memory when the user explicitly asks you to check, recall, or remember.',
   '- If the user says to *ignore* or *not use* memory: proceed as if MEMORY.md were empty. Do not apply remembered facts, cite, compare against, or mention memory content.',
-  MEMORY_DRIFT_CAVEAT,
+  EN_MEMORY_DRIFT_CAVEAT,
 ]
 
 /**
- * `## Trusting what you recall` section. Heavier-weight guidance on HOW to
- * treat a memory once you've recalled it — separate from WHEN to access.
- *
- * Eval-validated (memory-prompt-iteration.eval.ts, 2026-03-17):
- *   H1 (verify function/file claims): 0/2 → 3/3 via appendSystemPrompt. When
- *      buried as a bullet under "When to access", dropped to 0/3 — position
- *      matters. The H1 cue is about what to DO with a memory, not when to
- *      look, so it needs its own section-level trigger context.
- *   H5 (read-side noise rejection): 0/2 → 3/3 via appendSystemPrompt, 2/3
- *      in-place as a bullet. Partial because "snapshot" is intuitively closer
- *      to "when to access" than H1 is.
- *
- * Known gap: H1 doesn't cover slash-command claims (0/3 on the /fork case —
- * slash commands aren't files or functions in the model's ontology).
+ * `## When to access memories` section. Includes MEMORY_DRIFT_CAVEAT.
  */
-export const TRUSTING_RECALL_SECTION: readonly string[] = [
-  // Header wording matters: "Before recommending" (action cue at the decision
-  // point) tested better than "Trusting what you recall" (abstract). The
-  // appendSystemPrompt variant with this header went 3/3; the abstract header
-  // went 0/3 in-place. Same body text — only the header differed.
+export const WHEN_TO_ACCESS_SECTION: readonly string[] = shouldUseChinese()
+  ? ZH_WHEN_TO_ACCESS_SECTION
+  : EN_WHEN_TO_ACCESS_SECTION
+
+/**
+ * English version of `## Before recommending from memory` section.
+ */
+const EN_TRUSTING_RECALL_SECTION: readonly string[] = [
   '## Before recommending from memory',
   '',
   'A memory that names a specific function, file, or flag is a claim that it existed *when the memory was written*. It may have been renamed, removed, or never merged. Before recommending it:',
@@ -256,9 +275,16 @@ export const TRUSTING_RECALL_SECTION: readonly string[] = [
 ]
 
 /**
- * Frontmatter format example with the `type` field.
+ * `## Trusting what you recall` section.
  */
-export const MEMORY_FRONTMATTER_EXAMPLE: readonly string[] = [
+export const TRUSTING_RECALL_SECTION: readonly string[] = shouldUseChinese()
+  ? ZH_TRUSTING_RECALL_SECTION
+  : EN_TRUSTING_RECALL_SECTION
+
+/**
+ * English version of frontmatter format example.
+ */
+const EN_MEMORY_FRONTMATTER_EXAMPLE: readonly string[] = [
   '```markdown',
   '---',
   'name: {{memory name}}',
@@ -269,3 +295,10 @@ export const MEMORY_FRONTMATTER_EXAMPLE: readonly string[] = [
   '{{memory content — for feedback/project types, structure as: rule/fact, then **Why:** and **How to apply:** lines}}',
   '```',
 ]
+
+/**
+ * Frontmatter format example with the `type` field.
+ */
+export const MEMORY_FRONTMATTER_EXAMPLE: readonly string[] = shouldUseChinese()
+  ? ZH_MEMORY_FRONTMATTER_EXAMPLE
+  : EN_MEMORY_FRONTMATTER_EXAMPLE

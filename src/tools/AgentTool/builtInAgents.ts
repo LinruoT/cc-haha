@@ -8,6 +8,7 @@ import { GENERAL_PURPOSE_AGENT } from './built-in/generalPurposeAgent.js'
 import { PLAN_AGENT } from './built-in/planAgent.js'
 import { STATUSLINE_SETUP_AGENT } from './built-in/statuslineSetup.js'
 import { VERIFICATION_AGENT } from './built-in/verificationAgent.js'
+import { REFLECTION_AGENT } from './built-in/reflectionAgent.js'
 import type { AgentDefinition } from './loadAgentsDir.js'
 
 export function areExplorePlanAgentsEnabled(): boolean {
@@ -66,6 +67,12 @@ export function getBuiltInAgents(): AgentDefinition[] {
     getFeatureValue_CACHED_MAY_BE_STALE('tengu_hive_evidence', false)
   ) {
     agents.push(VERIFICATION_AGENT)
+  }
+
+  // 添加反思Agent - 用于分析工具调用失败原因
+  // 默认启用，可通过环境变量 DISABLE_REFLECTION_AGENT 禁用
+  if (!isEnvTruthy(process.env.DISABLE_REFLECTION_AGENT)) {
+    agents.push(REFLECTION_AGENT)
   }
 
   return agents

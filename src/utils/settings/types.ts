@@ -1087,6 +1087,50 @@ export const SettingsSchema = lazySchema(() =>
             'Useful for enterprise administrators to add organization-specific context ' +
             '(e.g., "All plugins from our internal marketplace are vetted and approved.").',
         ),
+      toolExperience: z
+        .object({
+          enabled: z
+            .boolean()
+            .optional()
+            .describe('Enable tool experience system for learning from tool call failures (default: true)'),
+          directory: z
+            .string()
+            .optional()
+            .describe('Custom directory path for tool experience storage. Supports ~/ prefix for home directory expansion.'),
+          maxEntries: z
+            .number()
+            .int()
+            .positive()
+            .optional()
+            .describe('Maximum number of experience entries to keep (default: 1000)'),
+          autoExtract: z
+            .boolean()
+            .optional()
+            .describe('Automatically extract experiences from tool call failures (default: true)'),
+          modelConfigs: z
+            .record(
+              z.string(),
+              z.object({
+                enabled: z.boolean().optional(),
+                directory: z.string().optional(),
+              }),
+            )
+            .optional()
+            .describe('Per-model configuration for tool experience system'),
+        })
+        .optional()
+        .describe(
+          'Tool experience system configuration for learning from tool call failures. ' +
+            'When enabled, the system will store and retrieve experiences specific to each model, ' +
+            'helping the agent avoid repeating known tool call mistakes.',
+        ),
+      language: z
+        .string()
+        .optional()
+        .describe(
+          'Preferred language for Claude responses and voice dictation (e.g., "chinese", "japanese", "spanish"). ' +
+            'When set to "chinese", the system will use Chinese-optimized prompts.',
+        ),
     })
     .passthrough(),
 )
