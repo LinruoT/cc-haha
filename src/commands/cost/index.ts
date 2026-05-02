@@ -4,11 +4,14 @@
  */
 import type { Command } from '../../commands.js'
 import { isClaudeAISubscriber } from '../../utils/auth.js'
+import { shouldUseChinese } from '../../utils/language.js'
 
 const cost = {
   type: 'local',
   name: 'cost',
-  description: 'Show the total cost and duration of the current session',
+  description: shouldUseChinese()
+    ? '显示当前会话的总成本和持续时间'
+    : 'Show the total cost and duration of the current session',
   get isHidden() {
     // Keep visible for Ants even if they're subscribers (they see cost breakdowns)
     if (process.env.USER_TYPE === 'ant') {

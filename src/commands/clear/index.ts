@@ -6,11 +6,14 @@
  * - clearConversation: import from './clear/conversation.js'
  */
 import type { Command } from '../../commands.js'
+import { shouldUseChinese } from '../../utils/language.js'
 
 const clear = {
   type: 'local',
   name: 'clear',
-  description: 'Clear conversation history and free up context',
+  description: shouldUseChinese()
+    ? '清除对话历史并释放上下文'
+    : 'Clear conversation history and free up context',
   aliases: ['reset', 'new'],
   supportsNonInteractive: false, // Should just create a new session
   load: () => import('./clear.js'),

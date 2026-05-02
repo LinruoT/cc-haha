@@ -1,4 +1,5 @@
 import type { Command, LocalCommandCall } from '../types/command.js'
+import { shouldUseChinese } from '../utils/language.js'
 
 const call: LocalCommandCall = async () => {
   return {
@@ -12,8 +13,9 @@ const call: LocalCommandCall = async () => {
 const version = {
   type: 'local',
   name: 'version',
-  description:
-    'Print the version this session is running (not what autoupdate downloaded)',
+  description: shouldUseChinese()
+    ? '打印当前会话运行的版本（不是自动更新下载的版本）'
+    : 'Print the version this session is running (not what autoupdate downloaded)',
   isEnabled: () => process.env.USER_TYPE === 'ant',
   supportsNonInteractive: true,
   load: () => Promise.resolve({ call }),
