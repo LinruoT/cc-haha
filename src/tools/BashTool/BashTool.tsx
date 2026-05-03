@@ -24,6 +24,7 @@ import { detectFileEncoding, detectLineEndings, getFileModificationTime, writeTe
 import { fileHistoryEnabled, fileHistoryTrackEdit } from '../../utils/fileHistory.js';
 import { truncate } from '../../utils/format.js';
 import { getFsImplementation } from '../../utils/fsOperations.js';
+import { shouldUseChinese } from '../../utils/language.js';
 import { lazySchema } from '../../utils/lazySchema.js';
 import { expandPath } from '../../utils/path.js';
 import type { PermissionResult } from '../../utils/permissions/PermissionResult.js';
@@ -426,6 +427,9 @@ export const BashTool = buildTool({
   async description({
     description
   }) {
+    if (shouldUseChinese()) {
+      return description || '运行 shell 命令'
+    }
     return description || 'Run shell command';
   },
   async prompt() {

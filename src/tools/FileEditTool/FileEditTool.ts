@@ -40,6 +40,7 @@ import {
   fetchSingleFileGitDiff,
   type ToolUseDiff,
 } from '../../utils/gitDiff.js'
+import { shouldUseChinese } from '../../utils/language.js'
 import { logError } from '../../utils/log.js'
 import { expandPath } from '../../utils/path.js'
 import {
@@ -89,6 +90,9 @@ export const FileEditTool = buildTool({
   maxResultSizeChars: 100_000,
   strict: true,
   async description() {
+    if (shouldUseChinese()) {
+      return '用于编辑文件的工具'
+    }
     return 'A tool for editing files'
   },
   async prompt() {
