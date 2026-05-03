@@ -4,7 +4,7 @@ import { useMainLoopModel } from '../../hooks/useMainLoopModel.js';
 import { type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS, logEvent } from '../../services/analytics/index.js';
 import { useAppState, useSetAppState } from '../../state/AppState.js';
 import type { LocalJSXCommandOnDone } from '../../types/command.js';
-import { type EffortValue, getDisplayedEffortLevel, getEffortEnvOverride, getEffortValueDescription, isEffortLevel, toPersistableEffort } from '../../utils/effort.js';
+import { type EffortValue, getDisplayedEffortLevel, getEffortEnvOverride, getEffortValueDescription, isEffortLevel, modelSupportsMaxEffort, toPersistableEffort } from '../../utils/effort.js';
 import { updateSettingsForSource } from '../../utils/settings/settings.js';
 const COMMON_HELP_ARGS = ['help', '-h', '--help'];
 type EffortCommandResult = {
@@ -132,31 +132,37 @@ function _temp(s) {
   return s.effortValue;
 }
 function ApplyEffortAndClose(t0) {
-  const $ = _c(6);
+  const $ = _c(7);
   const {
     result,
     onDone
   } = t0;
   const setAppState = useSetAppState();
+  const model = useMainLoopModel();
   const {
     effortUpdate,
     message
   } = result;
+  let adjustedEffortUpdate = effortUpdate;
+  let adjustedMessage = message;
+  if (effortUpdate?.value === 'max' && !modelSupportsMaxEffort(model)) {
+    adjustedMessage = `${message}\nWarning: Max effort is not supported for ${model}. It will be automatically downgraded to high.`;
+  }
   let t1;
   let t2;
-  if ($[0] !== effortUpdate || $[1] !== message || $[2] !== onDone || $[3] !== setAppState) {
+  if ($[0] !== adjustedEffortUpdate || $[1] !== adjustedMessage || $[2] !== onDone || $[3] !== setAppState) {
     t1 = () => {
-      if (effortUpdate) {
+      if (adjustedEffortUpdate) {
         setAppState(prev => ({
           ...prev,
-          effortValue: effortUpdate.value
+          effortValue: adjustedEffortUpdate.value
         }));
       }
-      onDone(message);
+      onDone(adjustedMessage);
     };
-    t2 = [setAppState, effortUpdate, message, onDone];
-    $[0] = effortUpdate;
-    $[1] = message;
+    t2 = [setAppState, adjustedEffortUpdate, adjustedMessage, onDone];
+    $[0] = adjustedEffortUpdate;
+    $[1] = adjustedMessage;
     $[2] = onDone;
     $[3] = setAppState;
     $[4] = t1;
