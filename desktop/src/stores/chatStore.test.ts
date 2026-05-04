@@ -96,7 +96,7 @@ vi.mock('./cliTaskStore', () => ({
   },
 }))
 
-import { mapHistoryMessagesToUiMessages, useChatStore } from './chatStore'
+import { mapHistoryMessagesToUiMessages, reconstructAgentNotifications, useChatStore } from './chatStore'
 
 const TEST_SESSION_ID = 'test-session-1'
 const initialState = useChatStore.getState()
@@ -211,6 +211,83 @@ describe('chatStore history mapping', () => {
         content: '可见回复',
       },
     ])
+  })
+
+  it('filters task-notification turns and resumes at the next real user message', () => {
+    const messages: MessageEntry[] = [
+      {
+        id: 'user-real-1',
+        type: 'user',
+        timestamp: '2026-04-06T00:00:00.000Z',
+        content: '创建项目',
+      },
+      {
+        id: 'assistant-real-1',
+        type: 'assistant',
+        timestamp: '2026-04-06T00:00:01.000Z',
+        content: [{ type: 'text', text: '项目创建好了' }],
+      },
+      {
+        id: 'task-notification',
+        type: 'user',
+        timestamp: '2026-04-06T00:00:02.000Z',
+        content: '<task-notification>\n<task-id>bg-1</task-id>\n<tool-use-id>toolu_bg</tool-use-id>\n<status>completed</status>\n<summary>Background command completed</summary>\n</task-notification>',
+      },
+      {
+        id: 'assistant-task-response',
+        type: 'assistant',
+        timestamp: '2026-04-06T00:00:03.000Z',
+        content: [{ type: 'text', text: '旧后台任务通知，无需处理' }],
+      },
+      {
+        id: 'user-real-2',
+        type: 'user',
+        timestamp: '2026-04-06T00:00:04.000Z',
+        content: '继续真实问题',
+      },
+    ]
+
+    const mapped = mapHistoryMessagesToUiMessages(messages)
+
+    expect(mapped).toMatchObject([
+      {
+        id: 'user-real-1',
+        type: 'user_text',
+        content: '创建项目',
+      },
+      {
+        type: 'assistant_text',
+        content: '项目创建好了',
+      },
+      {
+        id: 'user-real-2',
+        type: 'user_text',
+        content: '继续真实问题',
+      },
+    ])
+    expect(JSON.stringify(mapped)).not.toContain('<task-notification>')
+    expect(JSON.stringify(mapped)).not.toContain('旧后台任务通知')
+  })
+
+  it('reconstructs task notifications from transcript XML before filtering it from UI', () => {
+    const restored = reconstructAgentNotifications([
+      {
+        id: 'task-notification',
+        type: 'user',
+        timestamp: '2026-04-06T00:00:00.000Z',
+        content: '<task-notification>\n<task-id>bg-1</task-id>\n<tool-use-id>toolu_bg</tool-use-id>\n<status>completed</status>\n<summary>Background command &amp; agent done</summary>\n<output-file>C:\\Temp\\bg.output</output-file>\n</task-notification>',
+      },
+    ])
+
+    expect(restored).toEqual({
+      toolu_bg: {
+        taskId: 'bg-1',
+        toolUseId: 'toolu_bg',
+        status: 'completed',
+        summary: 'Background command & agent done',
+        outputFile: 'C:\\Temp\\bg.output',
+      },
+    })
   })
 
   it('surfaces teammate prompt content when mapping member transcript history', () => {

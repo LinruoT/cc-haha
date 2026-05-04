@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { MessageList, buildRenderModel } from './MessageList'
+import { relativizeWorkspacePath } from './CurrentTurnChangeCard'
 import { sessionsApi } from '../../api/sessions'
 import { useChatStore } from '../../stores/chatStore'
 import { useSettingsStore } from '../../stores/settingsStore'
@@ -945,6 +946,13 @@ describe('MessageList nested tool calls', () => {
     )
   })
 
+  it('relativizes Windows checkpoint paths against the turn workdir', () => {
+    expect(relativizeWorkspacePath(
+      'C:\\Users\\Relakkes\\aacc\\src\\App.tsx',
+      'c:/users/relakkes/aacc',
+    )).toBe('src/App.tsx')
+  })
+
   it('matches live turn change checkpoints by user message index when transcript ids differ from local UI ids', async () => {
     vi.spyOn(sessionsApi, 'getTurnCheckpoints').mockResolvedValue({
       checkpoints: [
@@ -1001,6 +1009,51 @@ describe('MessageList nested tool calls', () => {
       'src/live.ts',
       0,
     )
+  })
+
+  it('keeps turn change cards anchored when the only response item is filtered from rendering', async () => {
+    vi.spyOn(sessionsApi, 'getTurnCheckpoints').mockResolvedValue({
+      checkpoints: [
+        {
+          target: {
+            targetUserMessageId: 'user-1',
+            userMessageIndex: 0,
+            userMessageCount: 1,
+          },
+          code: {
+            available: true,
+            filesChanged: ['src/blank-response.ts'],
+            insertions: 3,
+            deletions: 0,
+          },
+        },
+      ],
+    })
+
+    useChatStore.setState({
+      sessions: {
+        [ACTIVE_TAB]: makeSessionState({
+          messages: [
+            {
+              id: 'user-1',
+              type: 'user_text',
+              content: '生成文件',
+              timestamp: 1,
+            },
+            {
+              id: 'assistant-empty',
+              type: 'assistant_text',
+              content: '\n  ',
+              timestamp: 2,
+            },
+          ],
+        }),
+      },
+    })
+
+    render(<MessageList />)
+
+    expect(await screen.findByText('src/blank-response.ts')).toBeTruthy()
   })
 
   it('keeps historical turn change cards visible while the next turn is running', async () => {

@@ -1,8 +1,12 @@
 import { api } from './client'
+import type { AgentTaskNotification } from '../types/chat'
 import type { SessionListItem, MessageEntry } from '../types/session'
 
 type SessionsResponse = { sessions: SessionListItem[]; total: number }
-type MessagesResponse = { messages: MessageEntry[] }
+type MessagesResponse = {
+  messages: MessageEntry[]
+  taskNotifications?: AgentTaskNotification[]
+}
 type CreateSessionResponse = { sessionId: string }
 export type SessionRewindResponse = {
   target: {

@@ -199,13 +199,16 @@ export function CurrentTurnChangeCard({
   )
 }
 
-function relativizeWorkspacePath(filePath: string, workDir: string | null): string {
+export function relativizeWorkspacePath(filePath: string, workDir: string | null): string {
   const normalizedPath = filePath.replace(/\\/g, '/')
-  if (!workDir || !normalizedPath.startsWith('/')) return normalizedPath
+  const isAbsolute = normalizedPath.startsWith('/') || /^[a-zA-Z]:\//.test(normalizedPath)
+  if (!workDir || !isAbsolute) return normalizedPath
 
   const normalizedWorkDir = workDir.replace(/\\/g, '/').replace(/\/+$/, '')
-  if (normalizedPath === normalizedWorkDir) return ''
-  if (normalizedPath.startsWith(`${normalizedWorkDir}/`)) {
+  const comparablePath = normalizedPath.toLowerCase()
+  const comparableWorkDir = normalizedWorkDir.toLowerCase()
+  if (comparablePath === comparableWorkDir) return ''
+  if (comparablePath.startsWith(`${comparableWorkDir}/`)) {
     return normalizedPath.slice(normalizedWorkDir.length + 1)
   }
   return normalizedPath

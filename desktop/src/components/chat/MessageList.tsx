@@ -178,11 +178,13 @@ function buildTurnCardInsertionMap(
   turnChangeCards: TurnChangeCardModel[],
 ) {
   const lastResponseIndexByTurnId = new Map<string, number>()
+  const userIndexByTurnId = new Map<string, number>()
   let activeTurnId: string | null = null
 
   renderItems.forEach((item, index) => {
     if (item.kind === 'message' && item.message.type === 'user_text' && !item.message.pending) {
       activeTurnId = item.message.id
+      userIndexByTurnId.set(activeTurnId, index)
       return
     }
 
@@ -193,7 +195,9 @@ function buildTurnCardInsertionMap(
 
   const cardsByRenderIndex = new Map<number, TurnChangeCardModel[]>()
   turnChangeCards.forEach((card) => {
-    const renderIndex = lastResponseIndexByTurnId.get(card.target.messageId)
+    const renderIndex =
+      lastResponseIndexByTurnId.get(card.target.messageId) ??
+      userIndexByTurnId.get(card.target.messageId)
     if (renderIndex === undefined) return
     const existing = cardsByRenderIndex.get(renderIndex)
     if (existing) {

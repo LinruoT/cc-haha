@@ -374,6 +374,34 @@ describe('SessionService', () => {
     expect(page2.sessions).toHaveLength(1)
   })
 
+  it('should only parse the requested page when listing many sessions', async () => {
+    for (let i = 0; i < 12; i++) {
+      const id = `1000000${i.toString(16)}-bbbb-cccc-dddd-eeeeeeeeeeee`
+      const filePath = await writeSessionFile('-tmp-many-sessions', id, [
+        makeSnapshotEntry(),
+        makeUserEntry(`Message ${i}`),
+      ])
+      const mtime = new Date(Date.now() - i * 1000)
+      await fs.utimes(filePath, mtime, mtime)
+    }
+
+    const serviceWithSpy = service as unknown as {
+      readJsonlFile: (...args: unknown[]) => Promise<unknown>
+    }
+    const originalReadJsonlFile = serviceWithSpy.readJsonlFile.bind(service)
+    let readCount = 0
+    serviceWithSpy.readJsonlFile = async (...args) => {
+      readCount += 1
+      return originalReadJsonlFile(...args)
+    }
+
+    const result = await service.listSessions({ limit: 3, offset: 0 })
+
+    expect(result.total).toBe(12)
+    expect(result.sessions).toHaveLength(3)
+    expect(readCount).toBe(3)
+  })
+
   it('should filter sessions by project', async () => {
     const id1 = 'aaaaaaaa-1111-cccc-dddd-eeeeeeeeeeee'
     const id2 = 'aaaaaaaa-2222-cccc-dddd-eeeeeeeeeeee'
@@ -596,6 +624,98 @@ describe('SessionService', () => {
       type: 'assistant',
       content: [{ type: 'text', text: '正常助手消息' }],
     })
+  })
+
+  it('should hide task-notification turns and their automatic responses from history', async () => {
+    const sessionId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    const firstUserId = crypto.randomUUID()
+    const firstAssistantId = crypto.randomUUID()
+    const taskNotificationId = crypto.randomUUID()
+    const taskAssistantId = crypto.randomUUID()
+    const taskToolUseMessageId = crypto.randomUUID()
+    const taskToolResultId = crypto.randomUUID()
+    const taskAfterToolId = crypto.randomUUID()
+    const realFollowUpId = crypto.randomUUID()
+    const realAssistantId = crypto.randomUUID()
+
+    await writeSessionFile('-tmp-project', sessionId, [
+      makeSnapshotEntry(),
+      {
+        ...makeUserEntry('创建一个项目', firstUserId),
+        parentUuid: null,
+      },
+      {
+        ...makeAssistantEntry('项目已经创建', firstUserId),
+        uuid: firstAssistantId,
+      },
+      {
+        ...makeUserEntry(
+          '<task-notification>\n<task-id>bg-1</task-id>\n<tool-use-id>toolu_bg</tool-use-id>\n<status>completed</status>\n<summary>Background command completed</summary>\n</task-notification>',
+          taskNotificationId,
+        ),
+        parentUuid: firstAssistantId,
+      },
+      {
+        ...makeAssistantEntry('旧后台任务通知，无需处理', taskNotificationId),
+        uuid: taskAssistantId,
+      },
+      {
+        ...makeAssistantToolUseEntry([{
+          id: 'toolu_restart',
+          name: 'Bash',
+          input: { command: 'npm run dev' },
+        }], taskAssistantId),
+        uuid: taskToolUseMessageId,
+      },
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [{
+            type: 'tool_result',
+            tool_use_id: 'toolu_restart',
+            content: 'server restarted',
+          }],
+        },
+        uuid: taskToolResultId,
+        parentUuid: taskToolUseMessageId,
+        timestamp: '2026-01-01T00:03:00.000Z',
+      },
+      {
+        ...makeAssistantEntry('后台任务触发的工具调用完成', taskToolResultId),
+        uuid: taskAfterToolId,
+      },
+      {
+        ...makeUserEntry('继续真实问题', realFollowUpId),
+        parentUuid: taskAfterToolId,
+      },
+      {
+        ...makeAssistantEntry('真实回答', realFollowUpId),
+        uuid: realAssistantId,
+      },
+    ])
+
+    const messages = await service.getSessionMessages(sessionId)
+    const taskNotifications = await service.getSessionTaskNotifications(sessionId)
+
+    expect(messages.map((message) => message.id)).toEqual([
+      firstUserId,
+      firstAssistantId,
+      realFollowUpId,
+      realAssistantId,
+    ])
+    expect(JSON.stringify(messages)).not.toContain('<task-notification>')
+    expect(JSON.stringify(messages)).not.toContain('旧后台任务通知')
+    expect(JSON.stringify(messages)).not.toContain('server restarted')
+    expect(JSON.stringify(messages)).not.toContain('后台任务触发的工具调用完成')
+    expect(taskNotifications).toEqual([
+      {
+        taskId: 'bg-1',
+        toolUseId: 'toolu_bg',
+        status: 'completed',
+        summary: 'Background command completed',
+      },
+    ])
   })
 
   it('should reconstruct parent agent tool linkage from parentUuid chains', async () => {
@@ -1002,13 +1122,31 @@ describe('Sessions API', () => {
       makeSnapshotEntry(),
       makeUserEntry('Hello'),
       makeAssistantEntry('World'),
+      makeUserEntry(
+        '<task-notification>\n<task-id>bg-1</task-id>\n<tool-use-id>toolu_bg</tool-use-id>\n<status>failed</status>\n<summary>Background command failed &amp; stopped</summary>\n<output-file>C:\\Temp\\bg.output</output-file>\n</task-notification>',
+        crypto.randomUUID(),
+      ),
+      makeAssistantEntry('internal task response'),
     ])
 
     const res = await fetch(`${baseUrl}/api/sessions/${sessionId}/messages`)
     expect(res.status).toBe(200)
 
-    const body = (await res.json()) as { messages: unknown[] }
+    const body = (await res.json()) as {
+      messages: unknown[]
+      taskNotifications: unknown[]
+    }
     expect(body.messages).toHaveLength(2)
+    expect(JSON.stringify(body.messages)).not.toContain('<task-notification>')
+    expect(body.taskNotifications).toEqual([
+      {
+        taskId: 'bg-1',
+        toolUseId: 'toolu_bg',
+        status: 'failed',
+        summary: 'Background command failed & stopped',
+        outputFile: 'C:\\Temp\\bg.output',
+      },
+    ])
   })
 
   it('DELETE /api/sessions/:id should delete the session', async () => {
@@ -1302,6 +1440,107 @@ describe('Sessions API', () => {
     expect(todoDiffBody.diff).toContain('--- /dev/null')
     expect(todoDiffBody.diff).toContain('+++ b/notes/todo.md')
     expect(todoDiffBody.diff).toContain('+- ship workspace panel')
+  })
+
+  it('GET /api/sessions/:id/workspace/* should surface file-history changes for a non-git generated subdirectory', async () => {
+    const sessionId = crypto.randomUUID()
+    const workDir = path.join(tmpDir, 'workspace-file-history-generated')
+    const generatedFile = path.join(workDir, 'aacc', 'src', 'App.tsx')
+    const userId = crypto.randomUUID()
+
+    await fs.mkdir(path.dirname(generatedFile), { recursive: true })
+    await fs.writeFile(
+      generatedFile,
+      'export default function App() { return <main>Tetris</main> }\n',
+      'utf-8',
+    )
+
+    await writeSessionFile(sanitizePath(workDir), sessionId, [
+      makeSessionMetaEntry(workDir),
+      makeFileHistorySnapshotEntry(userId, {
+        'aacc/src/App.tsx': {
+          backupFileName: null,
+          version: 1,
+          backupTime: '2026-01-01T00:00:00.000Z',
+        },
+      }),
+      {
+        ...makeUserEntry('create aacc project', userId),
+        cwd: workDir,
+        sessionId,
+      },
+      makeAssistantEntry('DONE', userId),
+      makeUserEntry(
+        '<task-notification>\n<task-id>bg-1</task-id>\n<tool-use-id>toolu_bg</tool-use-id>\n<status>completed</status>\n<summary>Background command completed</summary>\n</task-notification>',
+        crypto.randomUUID(),
+      ),
+      makeAssistantEntry('Background task completed again, no action needed'),
+    ])
+
+    const statusRes = await fetch(`${baseUrl}/api/sessions/${sessionId}/workspace/status`)
+    expect(statusRes.status).toBe(200)
+    const statusBody = await statusRes.json() as {
+      state: string
+      workDir: string
+      isGitRepo: boolean
+      changedFiles: Array<{
+        path: string
+        status: string
+        additions: number
+        deletions: number
+      }>
+    }
+    expect(statusBody).toMatchObject({
+      state: 'ok',
+      workDir,
+      isGitRepo: false,
+    })
+    expect(statusBody.changedFiles).toEqual([
+      expect.objectContaining({
+        path: 'aacc/src/App.tsx',
+        status: 'added',
+        additions: 1,
+        deletions: 0,
+      }),
+    ])
+
+    const diffRes = await fetch(
+      `${baseUrl}/api/sessions/${sessionId}/workspace/diff?path=${encodeURIComponent('aacc/src/App.tsx')}`,
+    )
+    expect(diffRes.status).toBe(200)
+    const diffBody = await diffRes.json() as {
+      state: string
+      path: string
+      diff: string
+    }
+    expect(diffBody).toMatchObject({
+      state: 'ok',
+      path: 'aacc/src/App.tsx',
+    })
+    expect(diffBody.diff).toContain('diff --session /dev/null b/aacc/src/App.tsx')
+    expect(diffBody.diff).toContain('+export default function App() { return <main>Tetris</main> }')
+
+    const checkpointsRes = await fetch(`${baseUrl}/api/sessions/${sessionId}/turn-checkpoints`)
+    expect(checkpointsRes.status).toBe(200)
+    const checkpointsBody = await checkpointsRes.json() as {
+      checkpoints: Array<{
+        target: {
+          targetUserMessageId: string
+          userMessageIndex: number
+          userMessageCount: number
+        }
+        code: {
+          filesChanged: string[]
+        }
+      }>
+    }
+    expect(checkpointsBody.checkpoints).toHaveLength(1)
+    expect(checkpointsBody.checkpoints[0]?.target).toMatchObject({
+      targetUserMessageId: userId,
+      userMessageIndex: 0,
+      userMessageCount: 1,
+    })
+    expect(checkpointsBody.checkpoints[0]?.code.filesChanged).toEqual([generatedFile])
   })
 
   it('GET /api/sessions/:id/workspace/file and diff should require a path query', async () => {

@@ -2,7 +2,10 @@ import * as fs from 'node:fs/promises'
 import { execFile as execFileCallback } from 'node:child_process'
 import * as path from 'node:path'
 import { promisify } from 'node:util'
+import { diffLines } from 'diff'
 import type { MessageEntry } from './sessionService.js'
+import type { FileHistorySnapshot } from '../../utils/fileHistory.js'
+import { getClaudeConfigHomeDir } from '../../utils/envUtils.js'
 
 const MAX_PREVIEW_BYTES = 1024 * 1024
 const MAX_UNTRACKED_STAT_BYTES = 256 * 1024
@@ -225,6 +228,9 @@ export class WorkspaceService {
     private readonly resolveSessionMessages: (
       sessionId: string,
     ) => Promise<MessageEntry[]> = async () => [],
+    private readonly resolveSessionFileHistorySnapshots: (
+      sessionId: string,
+    ) => Promise<FileHistorySnapshot[]> = async () => [],
   ) {}
 
   async getStatus(sessionId: string): Promise<WorkspaceStatusResult> {
@@ -253,33 +259,28 @@ export class WorkspaceService {
     }
 
     const repoInfo = await this.getGitRepoInfo(workDir)
-    const sessionChanges = await this.getSessionFileChanges(
-      sessionId,
-      workspaceInfo.workspaceRoot,
+    const sessionChanges = this.mergeSessionFileChanges(
+      [
+        ...await this.getSessionFileChanges(
+          sessionId,
+          workspaceInfo.workspaceRoot,
+        ),
+        ...await this.getFileHistoryChanges(
+          sessionId,
+          workspaceInfo.workspaceRoot,
+        ),
+      ],
     )
 
-    if (sessionChanges.length > 0) {
-      sessionChanges.sort((a, b) => a.path.localeCompare(b.path))
-      return {
-        state: 'ok',
-        workDir,
-        repoName: repoInfo.kind === 'ok'
-          ? path.basename(repoInfo.repoRoot)
-          : path.basename(workspaceInfo.workspaceRoot),
-        branch: repoInfo.kind === 'ok' ? repoInfo.branch : null,
-        isGitRepo: repoInfo.kind === 'ok',
-        changedFiles: sessionChanges.map(({ diff: _diff, ...change }) => change),
-      }
-    }
-
     if (repoInfo.kind === 'not_git_repo') {
+      sessionChanges.sort((a, b) => a.path.localeCompare(b.path))
       return {
         state: 'ok',
         workDir,
         repoName: path.basename(workspaceInfo.workspaceRoot),
         branch: null,
         isGitRepo: false,
-        changedFiles: [],
+        changedFiles: sessionChanges.map(({ diff: _diff, ...change }) => change),
       }
     }
     if (repoInfo.kind === 'error') {
@@ -363,6 +364,20 @@ export class WorkspaceService {
     }
 
     changedFiles.sort((a, b) => a.path.localeCompare(b.path))
+    const changedFileByPath = new Map(changedFiles.map((file) => [file.path, file]))
+    for (const change of sessionChanges) {
+      if (!changedFileByPath.has(change.path)) {
+        changedFileByPath.set(change.path, {
+          path: change.path,
+          oldPath: change.oldPath,
+          status: change.status,
+          additions: change.additions,
+          deletions: change.deletions,
+        })
+      }
+    }
+    const mergedChangedFiles = [...changedFileByPath.values()]
+      .sort((a, b) => a.path.localeCompare(b.path))
 
     return {
       state: 'ok',
@@ -370,7 +385,7 @@ export class WorkspaceService {
       repoName: path.basename(repoInfo.repoRoot),
       branch: repoInfo.branch,
       isGitRepo: true,
-      changedFiles,
+      changedFiles: mergedChangedFiles,
     }
   }
 
@@ -542,6 +557,15 @@ export class WorkspaceService {
       return { state: 'ok', path: resolvedPath.relativePath, diff: sessionDiff }
     }
 
+    const fileHistoryDiff = await this.getFileHistoryDiff(
+      sessionId,
+      resolvedPath.workspaceRoot,
+      resolvedPath.relativePath,
+    )
+    if (fileHistoryDiff) {
+      return { state: 'ok', path: resolvedPath.relativePath, diff: fileHistoryDiff }
+    }
+
     const repoInfo = await this.getGitRepoInfo(resolvedPath.workspaceRoot)
     if (repoInfo.kind === 'not_git_repo') {
       return { state: 'not_git_repo', path: resolvedPath.relativePath }
@@ -681,6 +705,151 @@ export class WorkspaceService {
     return [...changes.values()]
   }
 
+  private async getFileHistoryChanges(
+    sessionId: string,
+    workspaceRoot: string,
+  ): Promise<SessionFileChange[]> {
+    let snapshots: FileHistorySnapshot[]
+    try {
+      snapshots = await this.resolveSessionFileHistorySnapshots(sessionId)
+    } catch {
+      return []
+    }
+    if (snapshots.length === 0) return []
+
+    const changes: SessionFileChange[] = []
+    const trackedPaths = this.collectFileHistoryTrackedPaths(snapshots)
+
+    for (const trackingPath of trackedPaths) {
+      const relativePath = this.resolveFileHistoryRelativePath(trackingPath, workspaceRoot)
+      if (!relativePath) continue
+
+      const beforeContent = await this.readFileHistoryBackupContent(
+        sessionId,
+        this.getEarliestFileHistoryBackupName(trackingPath, snapshots),
+      )
+      if (beforeContent === undefined) continue
+
+      const absolutePath = path.resolve(workspaceRoot, relativePath)
+      const afterContent = await this.readTextFileOrNull(absolutePath)
+      if (beforeContent === afterContent) continue
+
+      const stats = this.countDiffStats(beforeContent ?? '', afterContent ?? '')
+      changes.push({
+        path: relativePath,
+        status: beforeContent === null
+          ? 'added'
+          : afterContent === null
+            ? 'deleted'
+            : 'modified',
+        additions: stats.additions,
+        deletions: stats.deletions,
+        diff: this.buildSyntheticDiff(
+          beforeContent === null ? '/dev/null' : relativePath,
+          afterContent === null ? '/dev/null' : relativePath,
+          beforeContent ?? '',
+          afterContent ?? '',
+        ),
+      })
+    }
+
+    return changes
+  }
+
+  private async getFileHistoryDiff(
+    sessionId: string,
+    workspaceRoot: string,
+    relativePath: string,
+  ): Promise<string | null> {
+    const changes = await this.getFileHistoryChanges(sessionId, workspaceRoot)
+    return changes.find((change) => change.path === relativePath)?.diff ?? null
+  }
+
+  private mergeSessionFileChanges(changes: SessionFileChange[]): SessionFileChange[] {
+    const merged = new Map<string, SessionFileChange>()
+    for (const change of changes) {
+      const existing = merged.get(change.path)
+      if (!existing) {
+        merged.set(change.path, change)
+        continue
+      }
+
+      merged.set(change.path, {
+        ...existing,
+        status: change.status,
+        additions: change.additions,
+        deletions: change.deletions,
+        diff: change.diff ?? existing.diff,
+      })
+    }
+    return [...merged.values()]
+  }
+
+  private collectFileHistoryTrackedPaths(snapshots: FileHistorySnapshot[]): Set<string> {
+    const trackedPaths = new Set<string>()
+    for (const snapshot of snapshots) {
+      for (const trackingPath of Object.keys(snapshot.trackedFileBackups)) {
+        trackedPaths.add(trackingPath)
+      }
+    }
+    return trackedPaths
+  }
+
+  private getEarliestFileHistoryBackupName(
+    trackingPath: string,
+    snapshots: FileHistorySnapshot[],
+  ): string | null | undefined {
+    for (const snapshot of snapshots) {
+      const backup = snapshot.trackedFileBackups[trackingPath]
+      if (backup !== undefined) {
+        return backup.backupFileName
+      }
+    }
+    return undefined
+  }
+
+  private resolveFileHistoryRelativePath(
+    trackingPath: string,
+    workspaceRoot: string,
+  ): string | null {
+    const absolutePath = path.isAbsolute(trackingPath)
+      ? path.resolve(trackingPath)
+      : path.resolve(workspaceRoot, trackingPath)
+    if (!this.isWithinRoot(absolutePath, workspaceRoot)) return null
+    return this.normalizeRelativePath(path.relative(workspaceRoot, absolutePath))
+  }
+
+  private async readFileHistoryBackupContent(
+    sessionId: string,
+    backupFileName: string | null | undefined,
+  ): Promise<string | null | undefined> {
+    if (backupFileName === undefined) return undefined
+    if (backupFileName === null) return null
+    return await this.readTextFileOrNull(
+      path.join(getClaudeConfigHomeDir(), 'file-history', sessionId, backupFileName),
+    )
+  }
+
+  private async readTextFileOrNull(filePath: string): Promise<string | null> {
+    try {
+      const content = await fs.readFile(filePath)
+      if (content.includes(0)) return null
+      return content.toString('utf8')
+    } catch {
+      return null
+    }
+  }
+
+  private countDiffStats(oldContent: string, newContent: string): { additions: number; deletions: number } {
+    let additions = 0
+    let deletions = 0
+    for (const change of diffLines(oldContent, newContent)) {
+      if (change.added) additions += change.count || 0
+      if (change.removed) deletions += change.count || 0
+    }
+    return { additions, deletions }
+  }
+
   private extractSessionChangesFromTool(
     toolName: string,
     input: Record<string, unknown>,
@@ -812,9 +981,13 @@ export class WorkspaceService {
     if (newLines.at(-1) === '') newLines.pop()
 
     return [
-      `diff --session a/${oldPath} b/${newPath}`,
+      `diff --session ${
+        oldPath === '/dev/null' ? '/dev/null' : `a/${oldPath}`
+      } ${
+        newPath === '/dev/null' ? '/dev/null' : `b/${newPath}`
+      }`,
       `--- ${oldPath === '/dev/null' ? '/dev/null' : `a/${oldPath}`}`,
-      `+++ b/${newPath}`,
+      `+++ ${newPath === '/dev/null' ? '/dev/null' : `b/${newPath}`}`,
       `@@ -1,${oldLines.length} +1,${newLines.length} @@`,
       ...oldLines.map((line) => `-${line}`),
       ...newLines.map((line) => `+${line}`),
@@ -971,7 +1144,14 @@ export class WorkspaceService {
   }
 
   private isWithinRoot(targetPath: string, rootPath: string): boolean {
-    return targetPath === rootPath || targetPath.startsWith(`${rootPath}${path.sep}`)
+    const target = this.normalizeComparableAbsolutePath(targetPath)
+    const root = this.normalizeComparableAbsolutePath(rootPath)
+    return target === root || target.startsWith(`${root}${path.sep}`)
+  }
+
+  private normalizeComparableAbsolutePath(filePath: string): string {
+    const resolved = path.resolve(filePath)
+    return process.platform === 'win32' ? resolved.toLowerCase() : resolved
   }
 
   private normalizeRelativePath(filePath: string): string {

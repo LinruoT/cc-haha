@@ -20,8 +20,33 @@
 基于 Claude Code 泄露源码修复的**本地可运行版本**，支持接入任意 Anthropic 兼容 API（MiniMax、OpenRouter 等）。在完整 TUI 之外，还补全了 Computer Use（macOS / Windows）、打造了图形化**桌面端**，并支持通过 Telegram / 飞书**完整远程驱动**。
 
 <p align="center">
-  <a href="#功能">功能</a> · <a href="#桌面端预览">桌面端</a> · <a href="#架构概览">架构概览</a> · <a href="#快速开始">快速开始</a> · <a href="docs/guide/env-vars.md">环境变量</a> · <a href="docs/guide/faq.md">FAQ</a> · <a href="docs/guide/global-usage.md">全局使用</a> · <a href="#更多文档">更多文档</a>
+  <a href="#桌面端预览">桌面端</a> · <a href="#功能">功能</a> · <a href="#架构概览">架构概览</a> · <a href="#快速开始">快速开始</a> · <a href="docs/guide/env-vars.md">环境变量</a> · <a href="docs/guide/faq.md">FAQ</a> · <a href="docs/guide/global-usage.md">全局使用</a> · <a href="#更多文档">更多文档</a>
 </p>
+
+---
+
+## 桌面端预览
+
+Claude Code Haha 的桌面端把会话、多项目、代码 Diff、权限确认、提供商配置、定时任务和 IM 适配器集中到一个图形化工作台里，适合不想长期停留在终端里的日常开发工作流。
+
+<p align="center">
+  <a href="https://github.com/NanmiCoder/cc-haha/releases"><img src="https://img.shields.io/badge/⬇_下载桌面端-macOS_%7C_Windows-D97757?style=for-the-badge" alt="下载桌面端"></a>
+  &nbsp;
+  <a href="docs/desktop/04-installation.md"><img src="https://img.shields.io/badge/📖_安装指南-Guide-gray?style=for-the-badge" alt="安装指南"></a>
+</p>
+
+<table>
+  <tr>
+    <td align="center" width="33%"><img src="docs/images/desktop_ui/01_full_ui.png" alt="主界面"><br><b>主界面</b></td>
+    <td align="center" width="33%"><img src="docs/images/desktop_ui/02_edit_code.png" alt="代码编辑"><br><b>代码编辑 & Diff 视图</b></td>
+    <td align="center" width="33%"><img src="docs/images/desktop_ui/03_ask_question_and_permission.png" alt="权限控制"><br><b>权限控制 & AI 提问</b></td>
+  </tr>
+  <tr>
+    <td align="center" width="33%"><img src="docs/images/desktop_ui/05_settings.png" alt="提供商设置"><br><b>多提供商管理</b></td>
+    <td align="center" width="33%"><img src="docs/images/desktop_ui/08_scheduled_task.png" alt="定时任务"><br><b>定时任务</b></td>
+    <td align="center" width="33%"><img src="docs/images/desktop_ui/07_im.png" alt="IM 适配器"><br><b>IM 适配器（Telegram / 飞书）</b></td>
+  </tr>
+</table>
 
 ---
 
@@ -57,31 +82,6 @@
     <td align="center" width="25%"><img src="docs/images/08-state-data-flow.png" alt="状态与数据流"><br><b>状态与数据流</b></td>
   </tr>
 </table>
-
----
-
-## 桌面端预览
-
-<p align="center">
-  <a href="https://github.com/NanmiCoder/cc-haha/releases"><img src="https://img.shields.io/badge/⬇_下载桌面端-macOS_%7C_Windows-D97757?style=for-the-badge" alt="下载桌面端"></a>
-  &nbsp;
-  <a href="docs/desktop/04-installation.md"><img src="https://img.shields.io/badge/📖_安装指南-Guide-gray?style=for-the-badge" alt="安装指南"></a>
-</p>
-
-<table>
-  <tr>
-    <td align="center" width="33%"><img src="docs/images/desktop_ui/01_full_ui.png" alt="主界面"><br><b>主界面</b></td>
-    <td align="center" width="33%"><img src="docs/images/desktop_ui/02_edit_code.png" alt="代码编辑"><br><b>代码编辑 & Diff 视图</b></td>
-    <td align="center" width="33%"><img src="docs/images/desktop_ui/03_ask_question_and_permission.png" alt="权限控制"><br><b>权限控制 & AI 提问</b></td>
-  </tr>
-  <tr>
-    <td align="center" width="33%"><img src="docs/images/desktop_ui/05_settings.png" alt="提供商设置"><br><b>多提供商管理</b></td>
-    <td align="center" width="33%"><img src="docs/images/desktop_ui/08_scheduled_task.png" alt="定时任务"><br><b>定时任务</b></td>
-    <td align="center" width="33%"><img src="docs/images/desktop_ui/07_im.png" alt="IM 适配器"><br><b>IM 适配器（Telegram / 飞书）</b></td>
-  </tr>
-</table>
-
----
 
 ## 快速开始
 
@@ -176,38 +176,6 @@ http://127.0.0.1:2024
 
 ---
 
-## 技术栈
-
-| 类别 | 技术 |
-|------|------|
-| 运行时 | [Bun](https://bun.sh) |
-| 语言 | TypeScript |
-| 终端 UI | React + [Ink](https://github.com/vadimdemedes/ink) |
-| CLI 解析 | Commander.js |
-| API | Anthropic SDK |
-| 协议 | MCP, LSP |
-
----
-
-## 更多文档
-
-| 文档 | 说明 |
-|------|------|
-| [环境变量](docs/guide/env-vars.md) | 完整环境变量参考和配置方式 |
-| [第三方模型](docs/guide/third-party-models.md) | 接入 OpenAI / DeepSeek / Ollama 等非 Anthropic 模型 |
-| [记忆系统](docs/memory/01-usage-guide.md) | 跨会话持久化记忆的使用与实现 |
-| [多 Agent 系统](docs/agent/01-usage-guide.md) | 多代理编排、并行任务执行与 Teams 协作 |
-| [Skills 系统](docs/skills/01-usage-guide.md) | 可扩展能力插件、自定义工作流与条件激活 |
-| [Channel 系统](docs/channel/01-channel-system.md) | 通过 Telegram/飞书/Discord 等 IM 平台远程控制 Agent |
-| [Computer Use](docs/features/computer-use.md) | 桌面控制功能（截屏、鼠标、键盘）— [架构解析](docs/features/computer-use-architecture.md) |
-| [桌面端](docs/desktop/) | Tauri 2 + React 图形化客户端 — [快速上手](docs/desktop/01-quick-start.md) \| [架构设计](docs/desktop/02-architecture.md) \| [安装指南](docs/desktop/04-installation.md) |
-| [全局使用](docs/guide/global-usage.md) | 在任意目录启动 claude-haha |
-| [常见问题](docs/guide/faq.md) | 常见错误排查 |
-| [源码修复记录](docs/reference/fixes.md) | 相对于原始泄露源码的修复内容 |
-| [项目结构](docs/reference/project-structure.md) | 代码目录结构说明 |
-
----
-
 ## 赞助与合作
 
 本项目由个人利用业余时间维护，欢迎企业或个人赞助支持持续开发，也可洽谈定制、集成或商务合作。
@@ -270,6 +238,39 @@ http://127.0.0.1:2024
 </td>
 </tr>
 </table>
+
+---
+
+## 技术栈
+
+| 类别 | 技术 |
+|------|------|
+| 运行时 | [Bun](https://bun.sh) |
+| 语言 | TypeScript |
+| 终端 UI | React + [Ink](https://github.com/vadimdemedes/ink) |
+| CLI 解析 | Commander.js |
+| API | Anthropic SDK |
+| 协议 | MCP, LSP |
+
+---
+
+## 更多文档
+
+| 文档 | 说明 |
+|------|------|
+| [环境变量](docs/guide/env-vars.md) | 完整环境变量参考和配置方式 |
+| [第三方模型](docs/guide/third-party-models.md) | 接入 OpenAI / DeepSeek / Ollama 等非 Anthropic 模型 |
+| [贡献与质量门禁](docs/guide/contributing.md) | 本地测试、真实模型 baseline、PR 和 release 门禁 |
+| [记忆系统](docs/memory/01-usage-guide.md) | 跨会话持久化记忆的使用与实现 |
+| [多 Agent 系统](docs/agent/01-usage-guide.md) | 多代理编排、并行任务执行与 Teams 协作 |
+| [Skills 系统](docs/skills/01-usage-guide.md) | 可扩展能力插件、自定义工作流与条件激活 |
+| [Channel 系统](docs/channel/01-channel-system.md) | 通过 Telegram/飞书/Discord 等 IM 平台远程控制 Agent |
+| [Computer Use](docs/features/computer-use.md) | 桌面控制功能（截屏、鼠标、键盘）— [架构解析](docs/features/computer-use-architecture.md) |
+| [桌面端](docs/desktop/) | Tauri 2 + React 图形化客户端 — [快速上手](docs/desktop/01-quick-start.md) \| [架构设计](docs/desktop/02-architecture.md) \| [安装指南](docs/desktop/04-installation.md) |
+| [全局使用](docs/guide/global-usage.md) | 在任意目录启动 claude-haha |
+| [常见问题](docs/guide/faq.md) | 常见错误排查 |
+| [源码修复记录](docs/reference/fixes.md) | 相对于原始泄露源码的修复内容 |
+| [项目结构](docs/reference/project-structure.md) | 代码目录结构说明 |
 
 ---
 

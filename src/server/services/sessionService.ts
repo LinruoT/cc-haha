@@ -62,6 +62,14 @@ export type MessageEntry = {
   isSidechain?: boolean
 }
 
+export type SessionTaskNotification = {
+  taskId: string
+  toolUseId: string
+  status: 'completed' | 'failed' | 'stopped'
+  summary?: string
+  outputFile?: string
+}
+
 export type TranscriptUsageSnapshot = {
   source: 'transcript'
   totalCostUSD: number
@@ -175,6 +183,8 @@ const USER_INTERRUPTION_TEXTS = new Set([
 ])
 
 const NO_RESPONSE_REQUESTED_TEXT = 'No response requested.'
+const TASK_NOTIFICATION_RE = /^<task-notification>\s*[\s\S]*<\/task-notification>$/i
+const TASK_NOTIFICATION_BLOCK_RE = /<task-notification>\s*[\s\S]*?<\/task-notification>/i
 
 // ============================================================================
 // Service
@@ -352,6 +362,72 @@ export class SessionService {
     )
   }
 
+  private isToolResultContent(content: unknown): boolean {
+    return (
+      Array.isArray(content) &&
+      content.some((block) =>
+        block &&
+        typeof block === 'object' &&
+        (block as Record<string, unknown>).type === 'tool_result'
+      )
+    )
+  }
+
+  private isTaskNotificationContent(content: unknown): boolean {
+    const textBlocks = this.extractTextBlocks(content)
+    return (
+      textBlocks.length > 0 &&
+      textBlocks.every((text) => this.extractTaskNotificationXml(text) !== null)
+    )
+  }
+
+  private extractTaskNotificationXml(text: string): string | null {
+    const trimmed = text.trim()
+    if (TASK_NOTIFICATION_RE.test(trimmed)) return trimmed
+    return trimmed.match(TASK_NOTIFICATION_BLOCK_RE)?.[0] ?? null
+  }
+
+  private decodeXmlText(text: string): string {
+    return text
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&amp;/g, '&')
+  }
+
+  private readXmlTag(xml: string, tag: string): string | undefined {
+    const match = xml.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, 'i'))
+    return match?.[1] ? this.decodeXmlText(match[1].trim()) : undefined
+  }
+
+  private parseTaskNotificationContent(content: unknown): SessionTaskNotification | null {
+    const xml = this.extractTextBlocks(content)
+      .map((text) => this.extractTaskNotificationXml(text))
+      .find((value): value is string => value !== null)
+    if (!xml) return null
+
+    const toolUseId = this.readXmlTag(xml, 'tool-use-id')
+    const status = this.readXmlTag(xml, 'status')
+    if (
+      !toolUseId ||
+      (status !== 'completed' && status !== 'failed' && status !== 'stopped')
+    ) {
+      return null
+    }
+
+    const taskId = this.readXmlTag(xml, 'task-id') || toolUseId
+    const summary = this.readXmlTag(xml, 'summary')
+    const outputFile = this.readXmlTag(xml, 'output-file')
+    return {
+      taskId,
+      toolUseId,
+      status,
+      ...(summary ? { summary } : {}),
+      ...(outputFile ? { outputFile } : {}),
+    }
+  }
+
   private shouldHideTranscriptEntry(entry: RawEntry): boolean {
     const role = entry.message?.role
     const content = entry.message?.content
@@ -359,7 +435,8 @@ export class SessionService {
     if (role === 'user') {
       return (
         this.isInternalCommandBreadcrumb(content) ||
-        this.isSyntheticUserInterruption(content)
+        this.isSyntheticUserInterruption(content) ||
+        this.isTaskNotificationContent(content)
       )
     }
 
@@ -991,13 +1068,27 @@ export class SessionService {
     offset?: number
   }): Promise<{ sessions: SessionListItem[]; total: number }> {
     const sessionFiles = await this.discoverSessionFiles(options?.project)
+    const filesWithStats = (await Promise.all(sessionFiles.map(async (sessionFile) => {
+      try {
+        return {
+          ...sessionFile,
+          stat: await fs.stat(sessionFile.filePath),
+        }
+      } catch {
+        return null
+      }
+    }))).filter((item): item is NonNullable<typeof item> => item !== null)
+
+    filesWithStats.sort((a, b) => b.stat.mtime.getTime() - a.stat.mtime.getTime())
+
+    const total = filesWithStats.length
+    const offset = options?.offset ?? 0
+    const limit = options?.limit ?? 50
+    const paginatedFiles = filesWithStats.slice(offset, offset + limit)
 
     // Build session list items with metadata from file stats & first entries
-    const items: SessionListItem[] = []
-
-    for (const { filePath, projectDir, sessionId } of sessionFiles) {
+    const items = (await Promise.all(paginatedFiles.map(async ({ filePath, projectDir, sessionId, stat }) => {
       try {
-        const stat = await fs.stat(filePath)
         const entries = await this.readJsonlFile(filePath)
         const workDir = this.resolveWorkDirFromEntries(entries, projectDir)
         const workDirExists = await this.pathExists(workDir)
@@ -1018,7 +1109,7 @@ export class SessionService {
           }
         }
 
-        items.push({
+        return {
           id: sessionId,
           title,
           createdAt,
@@ -1027,21 +1118,14 @@ export class SessionService {
           projectPath: projectDir,
           workDir,
           workDirExists,
-        })
+        }
       } catch {
         // Skip unreadable files
+        return null
       }
-    }
+    }))).filter((item): item is SessionListItem => item !== null)
 
-    // Sort by modifiedAt descending (most recent first)
-    items.sort((a, b) => new Date(b.modifiedAt).getTime() - new Date(a.modifiedAt).getTime())
-
-    const total = items.length
-    const offset = options?.offset ?? 0
-    const limit = options?.limit ?? 50
-    const paginated = items.slice(offset, offset + limit)
-
-    return { sessions: paginated, total }
+    return { sessions: items, total }
   }
 
   /**
@@ -1210,6 +1294,20 @@ export class SessionService {
       aiTitle: title,
       timestamp: new Date().toISOString(),
     })
+  }
+
+  async getCustomTitle(sessionId: string): Promise<string | null> {
+    const found = await this.findSessionFile(sessionId)
+    if (!found) return null
+
+    const entries = await this.readJsonlFile(found.filePath)
+    let customTitle: string | null = null
+    for (const entry of entries) {
+      if (entry.type === 'custom-title' && typeof entry.customTitle === 'string' && entry.customTitle.trim()) {
+        customTitle = entry.customTitle
+      }
+    }
+    return customTitle
   }
 
   /**
@@ -1425,6 +1523,24 @@ export class SessionService {
     return [...snapshotsByMessageId.values()]
   }
 
+  async getSessionTaskNotifications(
+    sessionId: string,
+  ): Promise<SessionTaskNotification[]> {
+    const found = await this.findSessionFile(sessionId)
+    if (!found) {
+      throw ApiError.notFound(`Session not found: ${sessionId}`)
+    }
+
+    const entries = await this.readJsonlFile(found.filePath)
+    const notifications: SessionTaskNotification[] = []
+    for (const entry of entries) {
+      if (entry.message?.role !== 'user') continue
+      const notification = this.parseTaskNotificationContent(entry.message.content)
+      if (notification) notifications.push(notification)
+    }
+    return notifications
+  }
+
   // --------------------------------------------------------------------------
   // Private helpers
   // --------------------------------------------------------------------------
@@ -1433,6 +1549,7 @@ export class SessionService {
     const messages: MessageEntry[] = []
     const entriesByUuid = new Map<string, RawEntry>()
     const parentToolUseIdCache = new Map<string, string | undefined>()
+    let suppressTaskNotificationResponse = false
 
     for (const entry of entries) {
       if (typeof entry.uuid === 'string' && entry.uuid.length > 0) {
@@ -1446,6 +1563,23 @@ export class SessionService {
 
       // Skip meta entries (CLI internal bookkeeping)
       if (entry.isMeta) continue
+
+      const isTaskNotification =
+        entry.message.role === 'user' &&
+        this.isTaskNotificationContent(entry.message.content)
+      if (isTaskNotification) {
+        suppressTaskNotificationResponse = true
+        continue
+      }
+
+      if (
+        entry.message.role === 'user' &&
+        !this.isToolResultContent(entry.message.content)
+      ) {
+        suppressTaskNotificationResponse = false
+      } else if (suppressTaskNotificationResponse) {
+        continue
+      }
 
       if (this.shouldHideTranscriptEntry(entry)) continue
 

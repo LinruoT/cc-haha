@@ -29,10 +29,14 @@ import {
   type RewindTargetSelector,
 } from '../services/sessionRewindService.js'
 
-const workspaceService = new WorkspaceService(async (sessionId) => (
-  conversationService.getSessionWorkDir(sessionId) ||
-  await sessionService.getSessionWorkDir(sessionId)
-), async (sessionId) => sessionService.getSessionMessages(sessionId))
+const workspaceService = new WorkspaceService(
+  async (sessionId) => (
+    conversationService.getSessionWorkDir(sessionId) ||
+    await sessionService.getSessionWorkDir(sessionId)
+  ),
+  async (sessionId) => sessionService.getSessionMessages(sessionId),
+  async (sessionId) => sessionService.getSessionFileHistorySnapshots(sessionId),
+)
 
 export async function handleSessionsApi(
   req: Request,
@@ -202,8 +206,11 @@ async function getSession(sessionId: string): Promise<Response> {
 }
 
 async function getSessionMessages(sessionId: string): Promise<Response> {
-  const messages = await sessionService.getSessionMessages(sessionId)
-  return Response.json({ messages })
+  const [messages, taskNotifications] = await Promise.all([
+    sessionService.getSessionMessages(sessionId),
+    sessionService.getSessionTaskNotifications(sessionId),
+  ])
+  return Response.json({ messages, taskNotifications })
 }
 
 async function handleSessionWorkspaceRoute(
@@ -308,6 +315,7 @@ function isSessionNotFoundError(error: unknown): error is Error {
 }
 
 async function deleteSession(sessionId: string): Promise<Response> {
+  conversationService.markSessionDeleted(sessionId)
   await sessionService.deleteSession(sessionId)
   return Response.json({ ok: true })
 }

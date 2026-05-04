@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import * as fs from 'fs/promises'
 import * as os from 'os'
 import * as path from 'path'
-import { generateTitle } from '../services/titleService.js'
+import { generateTitle, saveAiTitle } from '../services/titleService.js'
+import { sessionService } from '../services/sessionService.js'
 
 describe('titleService', () => {
   let tmpDir: string
@@ -67,6 +68,21 @@ describe('titleService', () => {
     } finally {
       server.stop(true)
     }
+  })
+
+  test('does not persist automatic titles over a user custom title', async () => {
+    const { sessionId } = await sessionService.createSession(os.tmpdir())
+    await sessionService.renameSession(sessionId, 'My fixed name')
+
+    await expect(saveAiTitle(sessionId, 'Automatic topic')).resolves.toBe(false)
+
+    const detail = await sessionService.getSession(sessionId)
+    expect(detail?.title).toBe('My fixed name')
+
+    const found = await sessionService.findSessionFile(sessionId)
+    expect(found).not.toBeNull()
+    const content = await fs.readFile(found!.filePath, 'utf-8')
+    expect(content).not.toContain('"type":"ai-title"')
   })
 })
 

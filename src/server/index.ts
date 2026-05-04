@@ -14,8 +14,10 @@ import { cronScheduler } from './services/cronScheduler.js'
 import { handleProxyRequest } from './proxy/handler.js'
 import { ProviderService } from './services/providerService.js'
 import { handleHahaOAuthCallback } from './api/haha-oauth.js'
+import { handleHahaOpenAIOAuthCallback } from './api/haha-openai-oauth.js'
 import { ensureDesktopCliLauncherInstalled } from './services/desktopCliLauncherService.js'
 import { enableConfigs } from '../utils/config.js'
+import { diagnosticsService } from './services/diagnosticsService.js'
 
 function readArgValue(flag: string): string | undefined {
   const args = process.argv.slice(2)
@@ -48,6 +50,7 @@ const HOST = SERVER_OPTIONS.host
 
 export function startServer(port = PORT, host = HOST) {
   enableConfigs()
+  diagnosticsService.installConsoleCapture()
   ProviderService.setServerPort(port)
   const localConnectHost =
     host === '0.0.0.0' || host === '127.0.0.1' || host === 'localhost'
@@ -137,6 +140,10 @@ export function startServer(port = PORT, host = HOST) {
         return handleHahaOAuthCallback(url)
       }
 
+      if (url.pathname === '/callback/openai') {
+        return handleHahaOpenAIOAuthCallback(url)
+      }
+
       // REST API
       if (url.pathname.startsWith('/api/')) {
         // Enforce authentication when required
@@ -163,6 +170,12 @@ export function startServer(port = PORT, host = HOST) {
             headers,
           })
         } catch (error) {
+          void diagnosticsService.recordEvent({
+            type: 'api_request_failed',
+            severity: 'error',
+            summary: error instanceof Error ? error.message : String(error),
+            details: { path: url.pathname, method: req.method, error },
+          })
           console.error('[Server] API error:', error)
           return Response.json(
             { error: 'Internal server error' },
@@ -194,6 +207,12 @@ export function startServer(port = PORT, host = HOST) {
             headers,
           })
         } catch (error) {
+          void diagnosticsService.recordEvent({
+            type: 'proxy_request_failed',
+            severity: 'error',
+            summary: error instanceof Error ? error.message : String(error),
+            details: { path: url.pathname, method: req.method, error },
+          })
           console.error('[Server] Proxy error:', error)
           return Response.json(
             { type: 'error', error: { type: 'api_error', message: 'Internal proxy error' } },

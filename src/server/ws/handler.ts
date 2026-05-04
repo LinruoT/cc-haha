@@ -17,6 +17,7 @@ import { computerUseApprovalService } from '../services/computerUseApprovalServi
 import { sessionService } from '../services/sessionService.js'
 import { SettingsService } from '../services/settingsService.js'
 import { ProviderService } from '../services/providerService.js'
+import { diagnosticsService } from '../services/diagnosticsService.js'
 import { deriveTitle, generateTitle, saveAiTitle } from '../services/titleService.js'
 import { parseSlashCommand } from '../../utils/slashCommandParsing.js'
 import {
@@ -134,6 +135,13 @@ export const handleWebSocket = {
       switch (message.type) {
         case 'user_message':
           handleUserMessage(ws, message).catch((err) => {
+            void diagnosticsService.recordEvent({
+              type: 'ws_user_message_failed',
+              severity: 'error',
+              sessionId: ws.data.sessionId,
+              summary: err instanceof Error ? err.message : String(err),
+              details: err,
+            })
             console.error(`[WS] Unhandled error in handleUserMessage:`, err)
           })
           break
@@ -245,6 +253,13 @@ async function handleUserMessage(
       await pendingRuntimeTransition
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err)
+      void diagnosticsService.recordEvent({
+        type: 'runtime_transition_failed',
+        severity: 'error',
+        sessionId,
+        summary: errMsg,
+        details: err,
+      })
       console.error(`[WS] Runtime transition failed before handling user message for ${sessionId}: ${errMsg}`)
       sendMessage(ws, {
         type: 'error',
@@ -278,7 +293,12 @@ async function handleUserMessage(
   // Track user message for title generation
   let titleState = sessionTitleState.get(sessionId)
   if (!titleState) {
-    titleState = { userMessageCount: 0, hasCustomTitle: false, firstUserMessage: '', allUserMessages: [] }
+    titleState = {
+      userMessageCount: 0,
+      hasCustomTitle: !!(await sessionService.getCustomTitle(sessionId)),
+      firstUserMessage: '',
+      allUserMessages: [],
+    }
     sessionTitleState.set(sessionId, titleState)
   }
   titleState.userMessageCount++
@@ -509,6 +529,13 @@ async function restartSessionWithPermissionMode(
     console.log(`[WS] Restarted CLI for ${sessionId} with permission mode: ${mode}`)
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err)
+    void diagnosticsService.recordEvent({
+      type: 'permission_restart_failed',
+      severity: 'error',
+      sessionId,
+      summary: errMsg,
+      details: { mode, error: err },
+    })
     console.error(`[WS] Failed to restart CLI for ${sessionId}: ${errMsg}`)
     sendMessage(ws, {
       type: 'error',
@@ -546,6 +573,13 @@ async function restartSessionWithRuntimeConfig(
     console.log(`[WS] Restarted CLI for ${sessionId} with runtime override`)
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err)
+    void diagnosticsService.recordEvent({
+      type: 'runtime_config_restart_failed',
+      severity: 'error',
+      sessionId,
+      summary: errMsg,
+      details: { runtimeOverride: runtimeOverrides.get(sessionId), error: err },
+    })
     console.error(`[WS] Failed to restart CLI for ${sessionId} after runtime override: ${errMsg}`)
     sendMessage(ws, {
       type: 'error',
@@ -606,7 +640,11 @@ function triggerTitleGeneration(ws: ServerWebSocket<WebSocketData>, sessionId: s
       if (count === 1) {
         const placeholder = deriveTitle(text)
         if (placeholder) {
-          await saveAiTitle(sessionId, placeholder)
+          const saved = await saveAiTitle(sessionId, placeholder)
+          if (!saved) {
+            state.hasCustomTitle = true
+            return
+          }
           sendMessage(ws, { type: 'session_title_updated', sessionId, title: placeholder })
         }
       }
@@ -614,7 +652,11 @@ function triggerTitleGeneration(ws: ServerWebSocket<WebSocketData>, sessionId: s
       // Stage 2: AI-generated title
       const aiTitle = await generateTitle(text, runtimeProviderId)
       if (aiTitle) {
-        await saveAiTitle(sessionId, aiTitle)
+        const saved = await saveAiTitle(sessionId, aiTitle)
+        if (!saved) {
+          state.hasCustomTitle = true
+          return
+        }
         sendMessage(ws, { type: 'session_title_updated', sessionId, title: aiTitle })
       }
     } catch (err) {

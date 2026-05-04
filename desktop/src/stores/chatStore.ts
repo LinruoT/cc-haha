@@ -183,11 +183,14 @@ function updateSessionIn(
 }
 
 async function fetchAndMapSessionHistory(sessionId: string) {
-  const { messages } = await sessionsApi.getMessages(sessionId)
+  const { messages, taskNotifications } = await sessionsApi.getMessages(sessionId)
   return {
     rawMessages: messages,
     uiMessages: mapHistoryMessagesToUiMessages(messages),
-    restoredNotifications: reconstructAgentNotifications(messages),
+    restoredNotifications: {
+      ...reconstructAgentNotifications(messages),
+      ...agentNotificationRecordFromList(taskNotifications ?? []),
+    },
     lastTodos: extractLastTodoWriteFromHistory(messages),
     hasMessagesAfterTaskCompletion: hasUserMessagesAfterTaskCompletion(messages),
   }
@@ -863,6 +866,8 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 type AssistantHistoryBlock = { type: string; text?: string; thinking?: string; name?: string; id?: string; input?: unknown }
 type UserHistoryBlock = { type: string; text?: string; tool_use_id?: string; content?: unknown; is_error?: boolean; source?: { data?: string }; mimeType?: string; media_type?: string; name?: string }
 
+const TASK_NOTIFICATION_RE = /^<task-notification>\s*[\s\S]*<\/task-notification>$/i
+
 /**
  * Check if text is a teammate-message (internal agent-to-agent communication).
  * Uses full open+close tag match to avoid false positives on user text
@@ -870,6 +875,82 @@ type UserHistoryBlock = { type: string; text?: string; tool_use_id?: string; con
  */
 function isTeammateMessage(text: string): boolean {
   return text.includes('<teammate-message') && text.includes('</teammate-message>')
+}
+
+function extractHistoryTextBlocks(content: unknown): string[] {
+  if (typeof content === 'string') return [content]
+  if (!Array.isArray(content)) return []
+
+  return content
+    .flatMap((block) => {
+      if (!block || typeof block !== 'object') return []
+      const record = block as Record<string, unknown>
+      return record.type === 'text' && typeof record.text === 'string'
+        ? [record.text]
+        : []
+    })
+    .map((text) => text.trim())
+    .filter(Boolean)
+}
+
+function isTaskNotificationContent(content: unknown): boolean {
+  const textBlocks = extractHistoryTextBlocks(content)
+  return textBlocks.length > 0 && textBlocks.every((text) => extractTaskNotificationXml(text) !== null)
+}
+
+function extractTaskNotificationXml(text: string): string | null {
+  const trimmed = text.trim()
+  if (TASK_NOTIFICATION_RE.test(trimmed)) return trimmed
+  return trimmed.match(/<task-notification>\s*[\s\S]*?<\/task-notification>/i)?.[0] ?? null
+}
+
+function decodeXmlText(text: string): string {
+  return text
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&')
+}
+
+function readXmlTag(xml: string, tag: string): string | undefined {
+  const match = xml.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, 'i'))
+  return match?.[1] ? decodeXmlText(match[1].trim()) : undefined
+}
+
+function extractTaskNotification(content: unknown): AgentTaskNotification | null {
+  const xml = extractHistoryTextBlocks(content)
+    .map((text) => extractTaskNotificationXml(text))
+    .find((value): value is string => value !== null)
+  if (!xml) return null
+
+  const toolUseId = readXmlTag(xml, 'tool-use-id')
+  const status = readXmlTag(xml, 'status')
+  if (
+    !toolUseId ||
+    (status !== 'completed' && status !== 'failed' && status !== 'stopped')
+  ) {
+    return null
+  }
+
+  const taskId = readXmlTag(xml, 'task-id') || toolUseId
+  const summary = readXmlTag(xml, 'summary')
+  const outputFile = readXmlTag(xml, 'output-file')
+  return {
+    taskId,
+    toolUseId,
+    status,
+    ...(summary ? { summary } : {}),
+    ...(outputFile ? { outputFile } : {}),
+  }
+}
+
+function agentNotificationRecordFromList(
+  notifications: AgentTaskNotification[],
+): Record<string, AgentTaskNotification> {
+  return Object.fromEntries(
+    notifications.map((notification) => [notification.toolUseId, notification]),
+  )
 }
 
 const TEAMMATE_CONTENT_REGEX = /<teammate-message\s+teammate_id="([^"]+)"[^>]*>\n?([\s\S]*?)\n?<\/teammate-message>/g
@@ -982,6 +1063,11 @@ function extractLeadingFileReferences(text: string): {
  * teammate_ids found in subsequent user messages.
  */
 export function reconstructAgentNotifications(messages: MessageEntry[]): Record<string, AgentTaskNotification> {
+  const taskNotifications = messages
+    .filter((message) => message.type === 'user')
+    .map((message) => extractTaskNotification(message.content))
+    .filter((notification): notification is AgentTaskNotification => notification !== null)
+
   // Step 1: Collect Agent tool_use blocks → map agent name to toolUseId
   const agentNameToToolUseId = new Map<string, string>()
 
@@ -998,7 +1084,9 @@ export function reconstructAgentNotifications(messages: MessageEntry[]): Record<
     }
   }
 
-  if (agentNameToToolUseId.size === 0) return {}
+  if (agentNameToToolUseId.size === 0) {
+    return agentNotificationRecordFromList(taskNotifications)
+  }
 
   // Step 2: Extract <teammate-message> content by teammate_id
   // Skip lifecycle messages (shutdown_approved, idle_notification, etc.)
@@ -1044,6 +1132,10 @@ export function reconstructAgentNotifications(messages: MessageEntry[]): Record<
     }
   }
 
+  for (const notification of taskNotifications) {
+    notifications[notification.toolUseId] = notification
+  }
+
   return notifications
 }
 
@@ -1053,7 +1145,19 @@ export function mapHistoryMessagesToUiMessages(
 ): UIMessage[] {
   const includeTeammateMessages = options?.includeTeammateMessages === true
   const uiMessages: UIMessage[] = []
+  let suppressTaskNotificationResponse = false
+
   for (const msg of messages) {
+    if (msg.type === 'user' && isTaskNotificationContent(msg.content)) {
+      suppressTaskNotificationResponse = true
+      continue
+    }
+    if (msg.type === 'user') {
+      suppressTaskNotificationResponse = false
+    } else if (suppressTaskNotificationResponse) {
+      continue
+    }
+
     const timestamp = new Date(msg.timestamp).getTime()
     if (msg.type === 'user' && typeof msg.content === 'string') {
       if (isTeammateMessage(msg.content)) {

@@ -204,6 +204,84 @@ describe('WorkspaceService', () => {
     expect(diff.diff).toContain('+export default function App() { return <main>New</main> }')
   })
 
+  it('reports file-history changes without requiring a git repository', async () => {
+    const nonGitDir = await makeTempDir('workspace-service-file-history-')
+    const generatedFile = path.join(nonGitDir, 'aacc', 'src', 'App.tsx')
+    await fs.mkdir(path.dirname(generatedFile), { recursive: true })
+    await fs.writeFile(generatedFile, 'export default function App() { return <main>Tetris</main> }\n')
+
+    const service = new WorkspaceService(
+      async () => nonGitDir,
+      async () => [],
+      async () => [{
+        messageId: '11111111-1111-4111-8111-111111111111',
+        timestamp: new Date('2026-01-01T00:00:00.000Z'),
+        trackedFileBackups: {
+          'aacc/src/App.tsx': {
+            backupFileName: null,
+            version: 1,
+            backupTime: new Date('2026-01-01T00:00:00.000Z'),
+          },
+        },
+      }],
+    )
+
+    const status = await service.getStatus('session-1')
+
+    expect(status).toMatchObject({
+      state: 'ok',
+      workDir: nonGitDir,
+      isGitRepo: false,
+      changedFiles: [{
+        path: 'aacc/src/App.tsx',
+        status: 'added',
+        additions: 1,
+        deletions: 0,
+      }],
+    })
+
+    const diff = await service.getDiff('session-1', 'aacc/src/App.tsx')
+    expect(diff.state).toBe('ok')
+    expect(diff.diff).toContain('diff --session /dev/null b/aacc/src/App.tsx')
+    expect(diff.diff).toContain('+export default function App() { return <main>Tetris</main> }')
+  })
+
+  it('matches Windows file-history paths case-insensitively inside the workspace', async () => {
+    if (process.platform !== 'win32') return
+
+    const nonGitDir = await makeTempDir('workspace-service-windows-paths-')
+    const targetFile = path.join(nonGitDir, 'Child', 'index.ts')
+    await fs.mkdir(path.dirname(targetFile), { recursive: true })
+    await fs.writeFile(targetFile, 'export const value = 1\n')
+
+    const lowerDrivePath = targetFile[0]?.toLowerCase() + targetFile.slice(1)
+    const service = new WorkspaceService(
+      async () => nonGitDir,
+      async () => [],
+      async () => [{
+        messageId: '22222222-2222-4222-8222-222222222222',
+        timestamp: new Date('2026-01-01T00:00:00.000Z'),
+        trackedFileBackups: {
+          [lowerDrivePath]: {
+            backupFileName: null,
+            version: 1,
+            backupTime: new Date('2026-01-01T00:00:00.000Z'),
+          },
+        },
+      }],
+    )
+
+    const status = await service.getStatus('session-1')
+
+    expect(status.changedFiles).toEqual([{
+      path: 'Child/index.ts',
+      oldPath: undefined,
+      status: 'added',
+      additions: 1,
+      deletions: 0,
+    }])
+  })
+
   it('rejects traversal attempts for file, diff, and tree access', async () => {
     const repoDir = await createGitWorkspace()
     const service = new WorkspaceService(async () => repoDir)
