@@ -1,14 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Resolve symlink to get the real script path
-SOURCE="${BASH_SOURCE[0]}"
-while [ -L "$SOURCE" ]; do
-  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
-  SOURCE="$(readlink "$SOURCE")"
-  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
-done
-ROOT_DIR="$(cd -P "$(dirname "$SOURCE")/.." && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 #Get your current working directory and export it as an environment variable.
 export CALLER_DIR="${CALLER_DIR:-$(pwd -W 2>/dev/null || pwd)}"
 
@@ -20,25 +13,18 @@ cd "$ROOT_DIR"
 # provider keys (e.g., a MiniMax key as ANTHROPIC_API_KEY) that
 # override the active provider config.
 if [[ "${CC_HAHA_SKIP_DOTENV:-0}" == "1" ]]; then
+  # Bun auto-loads .env by default; explicitly point to /dev/null to suppress.
   ENV_FILE_FLAG="--env-file=/dev/null"
-elif [[ -f "$ROOT_DIR/.env" ]]; then
-  ENV_FILE_FLAG="--env-file=$ROOT_DIR/.env"
+elif [[ -f .env ]]; then
+  ENV_FILE_FLAG="--env-file=.env"
 else
   ENV_FILE_FLAG=""
 fi
 
-# Use bun from the same directory if available, otherwise hope it's in PATH
-BUN_BIN="$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")")/bun"
-if [[ -x "$BUN_BIN" ]]; then
-  BUN="$BUN_BIN"
-else
-  BUN="bun"
-fi
-
 # Force recovery CLI (simple readline REPL, no Ink TUI)
 if [[ "${CLAUDE_CODE_FORCE_RECOVERY_CLI:-0}" == "1" ]]; then
-  exec "$BUN" $ENV_FILE_FLAG "$ROOT_DIR/src/localRecoveryCli.ts" "$@"
+  exec bun $ENV_FILE_FLAG ./src/localRecoveryCli.ts "$@"
 fi
 
 # Default: full CLI with Ink TUI
-exec "$BUN" $ENV_FILE_FLAG "$ROOT_DIR/src/entrypoints/cli.tsx" "$@"
+exec bun $ENV_FILE_FLAG ./src/entrypoints/cli.tsx "$@"
