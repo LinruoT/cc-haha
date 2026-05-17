@@ -141,7 +141,36 @@ export function getZhOutputEfficiencySection(): string {
 - 自然里程碑处的高级状态更新
 - 改变计划的错误或阻碍
 
-如果一句话能说清楚，就不要用三句。偏好简短、直接的句子而不是长篇解释。这不适用于代码或工具调用。`
+如果一句话能说清楚，就不要用三句。偏好简短、直接的句子而不是长篇解释。这不适用于代码或工具调用。
+
+注意：请使用中文进行所有输出，包括内部思考过程。`
+}
+
+/**
+ * 中文输出样式配置
+ */
+export function getZhOutputStyleSection(
+  outputStyleConfig: { name: string; prompt: string } | null,
+): string | null {
+  if (outputStyleConfig === null) return null
+
+  return `# 输出样式: ${outputStyleConfig.name}
+${outputStyleConfig.prompt}`
+}
+
+/**
+ * 中文语言提示部分 - 明确要求thinking也使用中文
+ */
+export function getZhLanguageSection(): string {
+  return `# 语言要求
+
+请使用中文进行所有输出，包括：
+- 与用户的沟通和解释
+- 内部思考过程（thinking）
+- 工具调用的说明和注释
+- 错误消息和状态更新
+
+技术术语和代码标识符可以保持原样。`
 }
 
 /**
@@ -149,6 +178,59 @@ export function getZhOutputEfficiencySection(): string {
  */
 export function getZhAgentToolSection(): string {
   return `使用 ${AGENT_TOOL_NAME} 工具配合专业Agent来处理与Agent描述匹配的任务。子Agent对并行化独立查询或保护主上下文窗口免受过多结果影响很有价值，但在不需要时不应过度使用。重要的是，避免重复子Agent已经在做的工作——如果你将研究委托给子Agent，不要同时自己执行相同的搜索。`
+}
+
+/**
+ * 中文Hooks配置说明
+ */
+export function getZhHooksSection(): string {
+  return `用户可能在设置中配置"hooks"（钩子），这些是响应工具调用等事件而执行的shell命令。将来自hooks的反馈视为来自用户。如果你被hook阻止，确定是否可以根据阻止消息调整你的操作。如果不能，请用户检查他们的hooks配置。`
+}
+
+/**
+ * 中文系统提醒说明
+ */
+export function getZhSystemRemindersSection(): string {
+  return `- 工具结果和用户消息可能包含 \`<system-reminder>\` 标签。\`<system-reminder>\` 标签包含有用的信息和提醒。它们由系统自动添加，与它们出现的特定工具结果或用户消息没有直接关系。
+- 对话通过自动摘要具有无限的上下文。`
+}
+
+/**
+ * 中文安全风险提示
+ */
+export const ZH_CYBER_RISK_INSTRUCTION = `重要：协助授权的安全测试、防御性安全、CTF挑战和教育场景。拒绝破坏性技术、DoS攻击、大规模目标攻击、供应链入侵或用于恶意目的的检测规避请求。双用途安全工具（C2框架、凭证测试、漏洞开发）需要明确的授权上下文：渗透测试、CTF竞赛、安全研究或防御性用例。`
+
+/**
+ * 中文技能发现指导
+ */
+export function getZhDiscoverSkillsGuidance(): string | null {
+  return `相关技能会自动作为"与您任务相关的技能："提醒显示在每轮对话中。如果你即将做的事情这些技能没有覆盖——比如任务中途的转变、不寻常的工作流程、多步骤计划——请使用具体的描述调用技能发现工具。已经可见或加载的技能会被自动过滤。如果显示的技能已经覆盖了你的下一步操作，请跳过此步骤。`
+}
+
+/**
+ * 中文会话特定指导
+ */
+export function getZhSessionSpecificGuidanceSection(
+  enabledTools: Set<string>,
+  skillToolCommands: string[],
+): string | null {
+  const hasAskUserQuestionTool = enabledTools.has(ASK_USER_QUESTION_TOOL_NAME)
+  const hasSkills =
+    skillToolCommands.length > 0 && enabledTools.has(SKILL_TOOL_NAME)
+  const hasAgentTool = enabledTools.has(AGENT_TOOL_NAME)
+
+  const items = [
+    hasAskUserQuestionTool
+      ? `如果你不理解用户为什么拒绝了工具调用，请使用 ${ASK_USER_QUESTION_TOOL_NAME} 询问他们。`
+      : null,
+    hasAgentTool ? getZhAgentToolSection() : null,
+    hasSkills
+      ? `/<skill-name>（例如 /commit）是用户调用技能的简写。执行时，技能会扩展为完整的提示。使用技能工具来执行它们。重要：只使用技能工具中列出的用户可调用技能——不要猜测或使用内置的CLI命令。`
+      : null,
+  ].filter(item => item !== null)
+
+  if (items.length === 0) return null
+  return ['# 会话特定指导', ...items.map(item => ` - ${item}`)].join('\n')
 }
 
 /**
@@ -198,7 +280,10 @@ export function buildZhSystemPrompt(params: {
 
   const sections: string[] = [
     getZhIntroSection(),
+    getZhLanguageSection(), // 添加语言要求，明确thinking也要用中文
     getZhSystemSection(),
+    getZhSystemRemindersSection(), // 系统提醒说明
+    getZhHooksSection(), // Hooks配置说明
     getZhDoingTasksSection(),
     getZhActionsSection(),
     getZhUsingToolsSection(enabledTools),

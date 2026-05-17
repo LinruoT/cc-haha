@@ -59,6 +59,60 @@ bun run scripts/release.ts <patch|minor|major|x.y.z>  # 桌面端发版
 
 之后在任何目录运行 claude-haha 就行了。
 
+## 编译为独立二进制
+
+将 cc-haha 编译为单文件可执行二进制，内嵌 Bun 运行时，不依赖 node_modules：
+
+```bash
+cd /Users/billy/Documents/Personal/Dev/cc-haha
+
+# 1. 编译（使用 cli-standalone.ts 入口，它会先导入 preload.ts 设置 MACRO）
+~/.bun/bin/bun build --compile \
+  --target=bun \
+  --outfile=./dist/claude-haha \
+  --external=@anthropic-ai/bedrock-sdk \
+  --external=@anthropic-ai/foundry-sdk \
+  --external=@anthropic-ai/vertex-sdk \
+  --external=@anthropic-ai/mcpb \
+  --external=@azure/identity \
+  --external=@aws-sdk/client-bedrock \
+  --external=@aws-sdk/client-sts \
+  --external=@opentelemetry/exporter-trace-otlp-grpc \
+  --external=@opentelemetry/exporter-trace-otlp-http \
+  --external=@opentelemetry/exporter-trace-otlp-proto \
+  --external=@opentelemetry/exporter-logs-otlp-grpc \
+  --external=@opentelemetry/exporter-logs-otlp-http \
+  --external=@opentelemetry/exporter-logs-otlp-proto \
+  --external=@opentelemetry/exporter-metrics-otlp-grpc \
+  --external=@opentelemetry/exporter-metrics-otlp-http \
+  --external=@opentelemetry/exporter-metrics-otlp-proto \
+  --external=@opentelemetry/exporter-prometheus \
+  --external=sharp \
+  --external=fflate \
+  src/entrypoints/cli-standalone.ts
+
+# 2. macOS 签名（必须，否则系统会 SIGKILL）
+codesign --remove-signature ./dist/claude-haha
+codesign --sign - --force --timestamp=none ./dist/claude-haha
+
+# 3. 链接到 PATH
+ln -sf /Users/billy/Documents/Personal/Dev/cc-haha/dist/claude-haha ~/.bun/bin/claude-haha
+
+# 4. 验证
+claude-haha --version
+```
+
+### 关键说明
+
+- **入口文件**：必须用 `src/entrypoints/cli-standalone.ts`（而非 `cli.tsx`），它先 `import '../../preload.ts'` 设置 `globalThis.MACRO`，再加载 `cli.tsx`
+- **--external**：可选依赖标为 external，运行时按需 import，没装有 try/catch 兜底
+- **ripgrep**：编译后的二进制没有内嵌 ripgrep，需要系统安装 `brew install ripgrep`
+- **签名**：macOS 要求所有可执行文件有有效签名，bun 编译产物自带无效签名，必须 codesign 重签
+
+### 官方桌面端构建参考
+
+桌面端用 `desktop/scripts/build-sidecars.ts` 构建 sidecar 二进制，使用 `Bun.build()` API 而非 CLI，效果相同。核心区别是 sidecar 入口 (`desktop/sidecars/claude-sidecar.ts`) 会根据 mode 参数分发到 server/cli/adapters。
+
 ## 顶层架构
 
 项目有三个主要运行时入口：
