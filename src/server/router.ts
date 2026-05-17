@@ -21,6 +21,12 @@ import { handleHahaOAuthApi } from './api/haha-oauth.js'
 import { handleHahaOpenAIOAuthApi } from './api/haha-openai-oauth.js'
 import { handleMcpApi } from './api/mcp.js'
 import { handleDiagnosticsApi } from './api/diagnostics.js'
+import { handleDoctorApi } from './api/doctor.js'
+import { handleH5AccessApi } from './api/h5-access.js'
+import { handleActivityStatsApi } from './api/activityStats.js'
+import { handleOpenTargetsApi } from './api/open-targets.js'
+import { handleMemoryApi } from './api/memory.js'
+import { handleDesktopUiApi } from './api/desktop-ui.js'
 
 export async function handleApiRequest(req: Request, url: URL): Promise<Response> {
   const path = url.pathname
@@ -94,6 +100,24 @@ export async function handleApiRequest(req: Request, url: URL): Promise<Response
 
     case 'diagnostics':
       return handleDiagnosticsApi(req, url, segments)
+
+    case 'doctor':
+      return handleDoctorApi(req, url, segments)
+
+    case 'h5-access':
+      return handleH5AccessApi(req, url, segments)
+
+    case 'activity-stats':
+      return handleActivityStatsApi(req, url, segments)
+
+    case 'open-targets':
+      return handleOpenTargetsApi(req, url, segments)
+
+    case 'memory':
+      return handleMemoryApi(req, url, segments)
+
+    case 'desktop-ui':
+      return handleDesktopUiApi(req, url, segments)
 
     case 'filesystem':
       return handleFilesystemRoute(url.pathname, url)

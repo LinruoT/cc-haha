@@ -3,7 +3,7 @@ use std::{
     fs,
     io::{Error as IoError, ErrorKind, Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command as StdCommand, Stdio},
     str,
     sync::{
@@ -16,7 +16,9 @@ use std::{
 
 use portable_pty::{native_pty_system, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
-use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
+use tauri::menu::MenuBuilder;
+#[cfg(target_os = "macos")]
+use tauri::menu::{MenuItemBuilder, SubmenuBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::Emitter;
 use tauri::{AppHandle, Manager, PhysicalPosition, PhysicalSize, RunEvent, State, WindowEvent};
@@ -25,14 +27,339 @@ use tauri_plugin_shell::{
     ShellExt,
 };
 
+#[cfg(target_os = "macos")]
+mod macos_notifications {
+    use std::ffi::{CStr, CString};
+    use std::os::raw::{c_char, c_int};
+    use std::sync::{Mutex, OnceLock};
+
+    use serde::Serialize;
+    use tauri::{AppHandle, Emitter};
+
+    const ERROR_BUFFER_LEN: usize = 1024;
+
+    unsafe extern "C" {
+        fn cchh_notification_authorization_status(
+            error_buffer: *mut c_char,
+            error_buffer_len: usize,
+        ) -> c_int;
+        fn cchh_request_notification_authorization(
+            error_buffer: *mut c_char,
+            error_buffer_len: usize,
+        ) -> bool;
+        fn cchh_send_user_notification(
+            title: *const c_char,
+            body: *const c_char,
+            target: *const c_char,
+            error_buffer: *mut c_char,
+            error_buffer_len: usize,
+        ) -> bool;
+        fn cchh_set_notification_response_callback(callback: Option<extern "C" fn(*const c_char)>);
+    }
+
+    #[derive(Clone, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct NotificationClickPayload {
+        target: Option<String>,
+    }
+
+    static NOTIFICATION_APP_HANDLE: OnceLock<Mutex<Option<AppHandle>>> = OnceLock::new();
+
+    fn new_error_buffer() -> [c_char; ERROR_BUFFER_LEN] {
+        [0; ERROR_BUFFER_LEN]
+    }
+
+    fn read_error(buffer: &[c_char; ERROR_BUFFER_LEN]) -> Option<String> {
+        let message = unsafe { CStr::from_ptr(buffer.as_ptr()) }
+            .to_string_lossy()
+            .trim()
+            .to_string();
+        if message.is_empty() {
+            None
+        } else {
+            Some(message)
+        }
+    }
+
+    fn permission_from_status(status: c_int) -> &'static str {
+        match status {
+            1 => "denied",
+            2 | 3 | 4 => "granted",
+            _ => "default",
+        }
+    }
+
+    pub fn permission_state() -> Result<String, String> {
+        let mut error_buffer = new_error_buffer();
+        let status = unsafe {
+            cchh_notification_authorization_status(error_buffer.as_mut_ptr(), ERROR_BUFFER_LEN)
+        };
+
+        if status < 0 {
+            return Err(read_error(&error_buffer)
+                .unwrap_or_else(|| "failed to read macOS notification permission".to_string()));
+        }
+
+        Ok(permission_from_status(status).to_string())
+    }
+
+    pub fn request_permission() -> Result<String, String> {
+        let mut error_buffer = new_error_buffer();
+        let granted = unsafe {
+            cchh_request_notification_authorization(error_buffer.as_mut_ptr(), ERROR_BUFFER_LEN)
+        };
+
+        if granted {
+            return Ok("granted".to_string());
+        }
+
+        if let Some(error) = read_error(&error_buffer) {
+            return Err(error);
+        }
+
+        permission_state()
+    }
+
+    extern "C" fn handle_notification_response(target: *const c_char) {
+        let target = if target.is_null() {
+            None
+        } else {
+            let value = unsafe { CStr::from_ptr(target) }
+                .to_string_lossy()
+                .trim()
+                .to_string();
+            (!value.is_empty()).then_some(value)
+        };
+
+        let Some(app) = NOTIFICATION_APP_HANDLE
+            .get()
+            .and_then(|handle| handle.lock().ok().and_then(|guard| guard.clone()))
+        else {
+            return;
+        };
+
+        super::show_main_window(&app);
+        let _ = app.emit(
+            "desktop-notification-clicked",
+            NotificationClickPayload { target },
+        );
+    }
+
+    pub fn install_click_handler(app: AppHandle) {
+        let handle = NOTIFICATION_APP_HANDLE.get_or_init(|| Mutex::new(None));
+        if let Ok(mut guard) = handle.lock() {
+            *guard = Some(app);
+        }
+        unsafe { cchh_set_notification_response_callback(Some(handle_notification_response)) };
+    }
+
+    pub fn send_notification(
+        title: String,
+        body: Option<String>,
+        target: Option<String>,
+    ) -> Result<bool, String> {
+        let title = CString::new(title)
+            .map_err(|_| "notification title contains an unsupported NUL byte".to_string())?;
+        let body = body
+            .map(CString::new)
+            .transpose()
+            .map_err(|_| "notification body contains an unsupported NUL byte".to_string())?;
+        let target = target
+            .map(CString::new)
+            .transpose()
+            .map_err(|_| "notification target contains an unsupported NUL byte".to_string())?;
+
+        let mut error_buffer = new_error_buffer();
+        let sent = unsafe {
+            cchh_send_user_notification(
+                title.as_ptr(),
+                body.as_ref()
+                    .map_or(std::ptr::null(), |value| value.as_ptr()),
+                target
+                    .as_ref()
+                    .map_or(std::ptr::null(), |value| value.as_ptr()),
+                error_buffer.as_mut_ptr(),
+                ERROR_BUFFER_LEN,
+            )
+        };
+
+        if sent {
+            return Ok(true);
+        }
+
+        match read_error(&error_buffer).as_deref() {
+            Some("not_authorized") | None => Ok(false),
+            Some(error) => Err(error.to_string()),
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+mod macos_notifications {
+    use tauri::AppHandle;
+
+    pub fn permission_state() -> Result<String, String> {
+        Ok("unsupported".to_string())
+    }
+
+    pub fn request_permission() -> Result<String, String> {
+        Ok("unsupported".to_string())
+    }
+
+    pub fn install_click_handler(_app: AppHandle) {}
+
+    pub fn send_notification(
+        _title: String,
+        _body: Option<String>,
+        _target: Option<String>,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+}
+
 const SERVER_STARTUP_LOG_LIMIT: usize = 80;
+const SERVER_BIND_HOST: &str = "0.0.0.0";
+const SERVER_CONTROL_HOST: &str = "127.0.0.1";
 const MAIN_WINDOW_LABEL: &str = "main";
 const TRAY_SHOW_ID: &str = "tray_show";
 const TRAY_QUIT_ID: &str = "tray_quit";
 const WINDOW_STATE_FILE: &str = "window-state.json";
+const TERMINAL_CONFIG_FILE: &str = "terminal-config.json";
+const APP_MODE_FILE: &str = "app-mode.json";
 const MIN_WINDOW_WIDTH: u32 = 960;
 const MIN_WINDOW_HEIGHT: u32 = 640;
 const MIN_VISIBLE_PIXELS: i64 = 64;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum AppMode {
+    Default,
+    Portable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AppModeConfig {
+    #[serde(default = "default_app_mode")]
+    mode: AppMode,
+    #[serde(default)]
+    portable_dir: Option<String>,
+}
+
+fn default_app_mode() -> AppMode {
+    AppMode::Default
+}
+
+impl Default for AppModeConfig {
+    fn default() -> Self {
+        Self {
+            mode: AppMode::Default,
+            portable_dir: None,
+        }
+    }
+}
+
+/// Write the persisted app-mode.json to the given config directory.
+fn write_app_mode_config(config_dir: &Path, config: &AppModeConfig) {
+    let path = config_dir.join(APP_MODE_FILE);
+    if let Some(parent) = path.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            eprintln!("[desktop] failed to create dir for app-mode.json: {e}");
+            return;
+        }
+    }
+    let data = match serde_json::to_string_pretty(config) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("[desktop] failed to serialize app-mode.json: {e}");
+            return;
+        }
+    };
+    if let Err(e) = fs::write(&path, data) {
+        eprintln!("[desktop] failed to write app-mode.json: {e}");
+    }
+}
+
+/// Check if a directory contains portable config/data files.
+fn dir_has_portable_data(dir: &Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    [WINDOW_STATE_FILE, TERMINAL_CONFIG_FILE]
+        .iter()
+        .any(|f| dir.join(f).is_file())
+        || dir.join("Cache").is_dir()
+        || dir.join("EBWebView").is_dir()
+}
+
+/// Resolve the default portable config directory: exe_dir/CLAUDE_CONFIG_DIR.
+fn get_default_portable_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let mut dir = exe.parent()?.to_path_buf();
+    dir.push("CLAUDE_CONFIG_DIR");
+    Some(dir)
+}
+
+
+#[derive(Serialize, Deserialize)]
+struct TerminalConfig {
+    #[serde(default)]
+    bash_path: Option<String>,
+}
+
+impl TerminalConfig {
+    fn load(app: &AppHandle) -> Self {
+        let path = match terminal_config_path(app) {
+            Some(p) => p,
+            None => return Self::default(),
+        };
+        fs::read_to_string(&path)
+            .ok()
+            .and_then(|data| serde_json::from_str(&data).ok())
+            .unwrap_or_default()
+    }
+
+    fn save(&self, app: &AppHandle) -> Result<(), String> {
+        let Some(path) = terminal_config_path(app) else {
+            return Err("terminal config path is unavailable".to_string());
+        };
+        if let Some(parent) = path.parent() {
+            if let Err(err) = fs::create_dir_all(parent) {
+                return Err(format!("create terminal config directory: {err}"));
+            }
+        }
+        let data = match serde_json::to_string_pretty(self) {
+            Ok(data) => data,
+            Err(err) => {
+                return Err(format!("serialize terminal config: {err}"));
+            }
+        };
+        if let Err(err) = fs::write(&path, data) {
+            return Err(format!("write terminal config: {err}"));
+        }
+        Ok(())
+    }
+}
+
+fn terminal_config_path(app: &AppHandle) -> Option<PathBuf> {
+    // honour CLAUDE_CONFIG_DIR for portable installs
+    std::env::var("CLAUDE_CONFIG_DIR").ok().map(|dir| {
+        PathBuf::from(&dir).join(TERMINAL_CONFIG_FILE)
+    }).or_else(|| {
+        match app.path().app_config_dir() {
+            Ok(dir) => Some(dir.join(TERMINAL_CONFIG_FILE)),
+            Err(err) => {
+                eprintln!("[desktop] failed to resolve app config dir: {err}");
+                None
+            }
+        }
+    })
+}
+
+impl Default for TerminalConfig {
+    fn default() -> Self {
+        Self { bash_path: None }
+    }
+}
 
 #[derive(Default)]
 struct ServerState(Mutex<ServerStatus>);
@@ -64,12 +391,12 @@ struct StoredWindowState {
 
 /// 与 ServerState 平级的 adapter 子进程状态。
 ///
-/// adapter sidecar（claude-sidecar adapters --feishu --telegram）的生命周期
+/// adapter sidecar（claude-sidecar adapters --telegram 等）的生命周期
 /// 跟 server 不同：它没有 HTTP 端口可探活，没配凭据时会自己干净退出，
-/// 而且需要支持运行时热重启 —— 用户在设置页保存飞书 / Telegram 凭据后，
+/// 而且需要支持运行时热重启 —— 用户在设置页保存 IM 凭据后，
 /// 前端会通过 invoke('restart_adapters_sidecar') 来重启它，让新凭据生效。
 #[derive(Default)]
-struct AdapterState(Mutex<Option<CommandChild>>);
+struct AdapterState(Mutex<Vec<CommandChild>>);
 
 #[derive(Default)]
 struct TerminalState {
@@ -120,7 +447,7 @@ fn get_server_url(state: State<'_, ServerState>) -> Result<String, String> {
         .unwrap_or_else(|| "desktop server did not start".to_string()))
 }
 
-/// 前端在设置页保存飞书 / Telegram 凭据后调用，触发 adapter sidecar 热重启。
+/// 前端在设置页保存飞书 / Telegram / 微信凭据后调用，触发 adapter sidecar 热重启。
 ///
 /// 流程：
 ///   1. kill 当前 adapter 子进程（如果在跑）
@@ -153,12 +480,95 @@ fn prepare_for_update_install(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-fn mark_app_quitting(app: &AppHandle) {
-    if let Some(state) = app.try_state::<AppExitState>() {
-        if let Ok(mut is_quitting) = state.is_quitting.lock() {
-            *is_quitting = true;
+#[tauri::command]
+fn cancel_update_install(app: AppHandle) -> Result<(), String> {
+    clear_app_quitting(&app);
+    Ok(())
+}
+
+/// Returns the current app mode and portable directory info.
+#[tauri::command]
+fn get_app_mode() -> serde_json::Value {
+    let config_dir = if let Ok(cd) = std::env::var("CLAUDE_CONFIG_DIR") {
+        Some(PathBuf::from(&cd))
+    } else {
+        get_default_portable_dir()
+    };
+
+    serde_json::json!({
+        "mode": if std::env::var("CLAUDE_CONFIG_DIR").is_ok() { "portable" } else { "default" },
+        "portableDir": config_dir.as_ref().and_then(|p| p.to_str()),
+        "defaultPortableDir": get_default_portable_dir().as_ref().and_then(|p| p.to_str()),
+    })
+}
+
+/// Sets the app mode. Persists to app-mode.json in the current active config dir.
+/// Requires restart to take effect.
+#[tauri::command]
+fn set_app_mode(app: tauri::AppHandle, mode: String, portable_dir: Option<String>) {
+    use tauri::Manager; // 确保作用域内引入 Manager
+
+    // 确定当前正在使用的配置目录
+    let active_config_dir = if let Ok(cd) = std::env::var("CLAUDE_CONFIG_DIR") {
+        std::path::PathBuf::from(&cd)
+    } else {
+        match app.path().app_config_dir() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[desktop] set_app_mode: failed to resolve config dir: {e}");
+                return;
+            }
+        }
+    };
+
+    let app_mode = if mode == "portable" {
+        AppMode::Portable
+    } else {
+        AppMode::Default
+    };
+
+    let config = AppModeConfig {
+        mode: app_mode,
+        portable_dir,
+    };
+    
+    // 写入当前活跃的配置目录
+    write_app_mode_config(&active_config_dir, &config);
+
+    // 修复：同时始终将模式状态写入系统默认配置目录，
+    // 以防止应用层切换模式后，main.rs在下一次启动时读取到旧的系统全局状态
+    if let Ok(sys_dir) = app.path().app_config_dir() {
+        if sys_dir != active_config_dir {
+            write_app_mode_config(&sys_dir, &config);
         }
     }
+}
+
+/// Checks if the default portable directory has existing data files.
+#[tauri::command]
+fn detect_portable_dir() -> serde_json::Value {
+    let default_portable = get_default_portable_dir();
+    let has_data = default_portable.as_ref().map(|d| dir_has_portable_data(d)).unwrap_or(false);
+    serde_json::json!({
+        "defaultPortableDir": default_portable.as_ref().and_then(|p| p.to_str()),
+        "hasData": has_data,
+    })
+}
+
+fn set_app_quitting(app: &AppHandle, next: bool) {
+    if let Some(state) = app.try_state::<AppExitState>() {
+        if let Ok(mut is_quitting) = state.is_quitting.lock() {
+            *is_quitting = next;
+        }
+    }
+}
+
+fn mark_app_quitting(app: &AppHandle) {
+    set_app_quitting(app, true);
+}
+
+fn clear_app_quitting(app: &AppHandle) {
+    set_app_quitting(app, false);
 }
 
 fn should_hide_to_tray(app: &AppHandle, label: &str) -> bool {
@@ -214,13 +624,24 @@ fn is_window_state_visible_on_any_monitor(
 }
 
 fn window_state_path(app: &AppHandle) -> Option<PathBuf> {
-    match app.path().app_config_dir() {
-        Ok(dir) => Some(dir.join(WINDOW_STATE_FILE)),
-        Err(err) => {
-            eprintln!("[desktop] failed to resolve app config dir: {err}");
-            None
+    // honour CLAUDE_CONFIG_DIR so portable installs keep window-state.json
+    // and terminal-config.json alongside the config dir instead of
+    // %APPDATA%\com.claude-code-haha.desktop\.
+    resolve_portable_state_path().or_else(|| {
+        match app.path().app_config_dir() {
+            Ok(dir) => Some(dir.join(WINDOW_STATE_FILE)),
+            Err(err) => {
+                eprintln!("[desktop] failed to resolve app config dir: {err}");
+                None
+            }
         }
-    }
+    })
+}
+
+fn resolve_portable_state_path() -> Option<PathBuf> {
+    std::env::var("CLAUDE_CONFIG_DIR").ok().map(|dir| {
+        PathBuf::from(&dir).join(WINDOW_STATE_FILE)
+    })
 }
 
 fn read_stored_window_state(app: &AppHandle) -> Option<StoredWindowState> {
@@ -404,7 +825,8 @@ fn terminal_spawn(
     cwd: Option<String>,
 ) -> Result<TerminalSpawnResult, String> {
     let cwd_path = resolve_terminal_cwd(cwd)?;
-    let shell = default_shell();
+    let terminal_config = TerminalConfig::load(&app);
+    let shell = default_shell(terminal_config.bash_path.as_deref());
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -604,6 +1026,77 @@ fn terminal_kill(state: State<'_, TerminalState>, session_id: u32) -> Result<(),
     Ok(())
 }
 
+#[tauri::command]
+fn get_terminal_bash_path(app: AppHandle) -> Option<String> {
+    let config = TerminalConfig::load(&app);
+    config.bash_path
+}
+
+#[tauri::command]
+fn set_terminal_bash_path(app: AppHandle, path: Option<String>) -> Result<(), String> {
+    let mut config = TerminalConfig::load(&app);
+    config.bash_path = normalize_terminal_bash_path(path)?;
+    config.save(&app)
+}
+
+#[tauri::command]
+async fn macos_notification_permission_state() -> Result<String, String> {
+    run_notification_bridge(macos_notifications::permission_state).await
+}
+
+#[tauri::command]
+async fn macos_request_notification_permission() -> Result<String, String> {
+    run_notification_bridge(macos_notifications::request_permission).await
+}
+
+#[tauri::command]
+async fn macos_send_notification(
+    title: String,
+    body: Option<String>,
+    target: Option<String>,
+) -> Result<bool, String> {
+    run_notification_bridge(move || macos_notifications::send_notification(title, body, target))
+        .await
+}
+
+#[tauri::command]
+fn open_windows_notification_settings() -> Result<bool, String> {
+    open_windows_notification_settings_impl()
+}
+
+#[tauri::command]
+fn set_app_zoom(window: tauri::WebviewWindow, zoom_factor: f64) -> Result<(), String> {
+    let clamped = zoom_factor.clamp(0.5, 2.0);
+    window
+        .set_zoom(clamped)
+        .map_err(|err| format!("set app zoom: {err}"))
+}
+
+#[cfg(target_os = "windows")]
+fn open_windows_notification_settings_impl() -> Result<bool, String> {
+    StdCommand::new("explorer.exe")
+        .arg("ms-settings:notifications")
+        .spawn()
+        .map_err(|err| format!("open Windows notification settings: {err}"))?;
+
+    Ok(true)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn open_windows_notification_settings_impl() -> Result<bool, String> {
+    Ok(false)
+}
+
+async fn run_notification_bridge<T, F>(operation: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(operation)
+        .await
+        .map_err(|err| format!("notification bridge worker failed: {err}"))?
+}
+
 fn decode_terminal_output(pending: &mut Vec<u8>, chunk: &[u8]) -> String {
     pending.extend_from_slice(chunk);
     let mut output = String::new();
@@ -767,7 +1260,31 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn default_shell() -> String {
+fn normalize_terminal_bash_path(path: Option<String>) -> Result<Option<String>, String> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let bash_path = PathBuf::from(trimmed);
+    if !bash_path.is_file() {
+        return Err(format!("terminal bash path does not exist: {trimmed}"));
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
+fn default_shell(_custom_bash: Option<&str>) -> String {
+    // On Windows, use configured bash path if set and valid
+    #[cfg(target_os = "windows")]
+    if let Some(bash_path) = _custom_bash {
+        let trimmed = bash_path.trim();
+        if !trimmed.is_empty() && PathBuf::from(trimmed).is_file() {
+            return trimmed.to_string();
+        }
+    }
+
     #[cfg(target_os = "windows")]
     {
         std::env::var("COMSPEC").unwrap_or_else(|_| "powershell.exe".to_string())
@@ -784,9 +1301,9 @@ fn default_shell() -> String {
     }
 }
 
-fn reserve_local_port() -> Result<u16, String> {
-    let listener =
-        TcpListener::bind("127.0.0.1:0").map_err(|err| format!("bind local port: {err}"))?;
+fn reserve_local_port(bind_host: &str) -> Result<u16, String> {
+    let listener = TcpListener::bind(format!("{bind_host}:0"))
+        .map_err(|err| format!("bind local port: {err}"))?;
     let port = listener
         .local_addr()
         .map_err(|err| format!("read local port: {err}"))?
@@ -860,27 +1377,75 @@ fn resolve_app_root(_app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+fn select_h5_dist_dir(resource_dir: Option<&Path>, app_root: &Path) -> PathBuf {
+    let mut candidates = Vec::new();
+    if let Some(resource_dir) = resource_dir {
+        candidates.push(resource_dir.join("_up_").join("dist"));
+        candidates.push(resource_dir.join("dist"));
+    }
+    candidates.push(app_root.join("../Resources/_up_/dist"));
+    candidates.push(app_root.join("../Resources/dist"));
+
+    candidates
+        .iter()
+        .find(|candidate| candidate.join("index.html").is_file())
+        .cloned()
+        .unwrap_or_else(|| {
+            resource_dir
+                .map(|dir| dir.join("_up_").join("dist"))
+                .unwrap_or_else(|| app_root.join("../Resources/_up_/dist"))
+        })
+}
+
+fn resolve_h5_dist_dir(app: &AppHandle, app_root: &Path) -> PathBuf {
+    let resource_dir = app.path().resource_dir().ok();
+    select_h5_dist_dir(resource_dir.as_deref(), app_root)
+}
+
 fn start_server_sidecar(app: &AppHandle) -> Result<ServerRuntime, String> {
-    let host = "127.0.0.1";
-    let port = reserve_local_port()?;
-    let url = format!("http://{host}:{port}");
+    let bind_host = SERVER_BIND_HOST;
+    let control_host = SERVER_CONTROL_HOST;
+    let port = reserve_local_port(bind_host)?;
+    let url = format!("http://{control_host}:{port}");
     let app_root = resolve_app_root(app)?;
     let app_root_arg = app_root.to_string_lossy().to_string();
+    let h5_dist_dir = resolve_h5_dist_dir(app, &app_root)
+        .to_string_lossy()
+        .to_string();
 
     // 单一合并 sidecar：第一个参数选 server / cli / adapters 模式。
     let mut sidecar = app
         .shell()
         .sidecar("claude-sidecar")
         .map_err(|err| format!("resolve sidecar: {err}"))?;
-    for (key, value) in terminal_environment(&default_shell()) {
+    for (key, value) in terminal_environment(&default_shell(None)) {
         sidecar = sidecar.env(key, value);
+    }
+    // Pass through CLAUDE_CONFIG_DIR so the sidecar (Node.js) uses the same
+    // portable config directory. Also set XDG_CACHE_HOME to redirect the
+    // env-paths cache from %LOCALAPPDATA%\claude-cli-nodejs\ to alongside
+    // the portable config dir.
+    if let Ok(config_dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+        let cache_dir = PathBuf::from(&config_dir).join("Cache");
+        if let Err(e) = fs::create_dir_all(&cache_dir) {
+            eprintln!("[desktop] failed to create Cache dir: {e}");
+        }
+        sidecar = sidecar
+            .env("CLAUDE_CONFIG_DIR", &config_dir)
+            .env("XDG_CACHE_HOME", cache_dir.to_string_lossy().to_string())
+            .env("CLAUDE_H5_AUTO_PUBLIC_URL", "1")
+            .env("CLAUDE_H5_DIST_DIR", h5_dist_dir);
+    } else {
+        sidecar = sidecar
+            .env("CLAUDE_H5_AUTO_PUBLIC_URL", "1")
+            .env("CLAUDE_H5_DIST_DIR", h5_dist_dir);
     }
     let sidecar = sidecar.args([
         "server",
         "--app-root",
         &app_root_arg,
         "--host",
-        host,
+        bind_host,
         "--port",
         &port.to_string(),
     ]);
@@ -920,7 +1485,7 @@ fn start_server_sidecar(app: &AppHandle) -> Result<ServerRuntime, String> {
         }
     });
 
-    if let Err(err) = wait_for_server(host, port) {
+    if let Err(err) = wait_for_server(control_host, port) {
         let _ = child.kill();
         return Err(format_server_startup_error(&err, &startup_logs));
     }
@@ -942,9 +1507,12 @@ fn stop_server_sidecar(app: &AppHandle) {
     }
 }
 
-/// 启动 adapter sidecar。返回 Result 主要为了把"无法 spawn"和"spawn 后立刻
-/// 退出（凭据缺失）"区分开 —— 后者不算错误，是正常 default 状态。
-fn start_adapters_sidecar(app: &AppHandle) -> Result<CommandChild, String> {
+/// 启动 adapter sidecars。每个平台单独一个进程，避免某个平台的 SDK / long polling
+/// 影响其它平台（Telegram 尤其要求同一个 Bot Token 只有一个活跃 consumer）。
+fn start_adapters_sidecars(app: &AppHandle) -> Result<Vec<CommandChild>, String> {
+    #[cfg(unix)]
+    kill_stale_unix_adapter_sidecars();
+
     let app_root = resolve_app_root(app)?;
     let app_root_arg = app_root.to_string_lossy().to_string();
 
@@ -975,63 +1543,81 @@ fn start_adapters_sidecar(app: &AppHandle) -> Result<CommandChild, String> {
         server_http_url.clone()
     };
 
-    let mut sidecar = app
-        .shell()
-        .sidecar("claude-sidecar")
-        .map_err(|err| format!("resolve sidecar: {err}"))?;
-    for (key, value) in terminal_environment(&default_shell()) {
-        sidecar = sidecar.env(key, value);
-    }
-    let sidecar = sidecar.env("ADAPTER_SERVER_URL", &server_ws_url).args([
-        "adapters",
-        "--app-root",
-        &app_root_arg,
-        "--feishu",
-        "--telegram",
-    ]);
-
-    let (mut rx, child) = sidecar
-        .spawn()
-        .map_err(|err| format!("spawn adapter sidecar: {err}"))?;
-
-    // 用一个 async task 把 sidecar 的 stdout/stderr 转发出来。它退出时
-    // 整个 task 也会自然结束。
-    tauri::async_runtime::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            match event {
-                CommandEvent::Stdout(line) => {
-                    let line = String::from_utf8_lossy(&line);
-                    println!("[claude-adapters] {}", line.trim_end());
-                }
-                CommandEvent::Stderr(line) => {
-                    let line = String::from_utf8_lossy(&line);
-                    eprintln!("[claude-adapters] {}", line.trim_end());
-                }
-                CommandEvent::Terminated(payload) => {
-                    // exit code != 0 是常态：用户没配凭据时 sidecar 内部会
-                    // warn + skip + process.exit(1)。这里只 info 一行，
-                    // 不要当错误冒泡。
-                    println!(
-                        "[claude-adapters] sidecar exited (code={:?}, signal={:?})",
-                        payload.code, payload.signal
-                    );
-                }
-                _ => {}
-            }
+    let mut children = Vec::new();
+    for (label, flag) in [
+        ("feishu", "--feishu"),
+        ("telegram", "--telegram"),
+        ("wechat", "--wechat"),
+        ("dingtalk", "--dingtalk"),
+    ] {
+        let mut sidecar = app
+            .shell()
+            .sidecar("claude-sidecar")
+            .map_err(|err| format!("resolve {label} adapter sidecar: {err}"))?;
+        for (key, value) in terminal_environment(&default_shell(None)) {
+            sidecar = sidecar.env(key, value);
         }
-    });
+        // Pass through CLAUDE_CONFIG_DIR for portable installs
+        let mut sidecar_final = sidecar.env("ADAPTER_SERVER_URL", &server_ws_url);
+        if let Ok(config_dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+            let cache_dir = PathBuf::from(&config_dir).join("Cache");
+            sidecar_final = sidecar_final
+                .env("CLAUDE_CONFIG_DIR", &config_dir)
+                .env("XDG_CACHE_HOME", cache_dir.to_string_lossy().to_string());
+        }
+        let sidecar = sidecar_final.args([
+            "adapters",
+            "--app-root",
+            &app_root_arg,
+            flag,
+        ]);
 
-    Ok(child)
+        let (mut rx, child) = sidecar
+            .spawn()
+            .map_err(|err| format!("spawn {label} adapter sidecar: {err}"))?;
+        let label = label.to_string();
+
+        // 用一个 async task 把 sidecar 的 stdout/stderr 转发出来。它退出时
+        // 整个 task 也会自然结束。
+        tauri::async_runtime::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                match event {
+                    CommandEvent::Stdout(line) => {
+                        let line = String::from_utf8_lossy(&line);
+                        println!("[claude-adapters:{label}] {}", line.trim_end());
+                    }
+                    CommandEvent::Stderr(line) => {
+                        let line = String::from_utf8_lossy(&line);
+                        eprintln!("[claude-adapters:{label}] {}", line.trim_end());
+                    }
+                    CommandEvent::Terminated(payload) => {
+                        // exit code != 0 是常态：用户没配凭据时 sidecar 内部会
+                        // warn + skip + process.exit(1)。这里只 info 一行，
+                        // 不要当错误冒泡。
+                        println!(
+                            "[claude-adapters:{label}] sidecar exited (code={:?}, signal={:?})",
+                            payload.code, payload.signal
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        children.push(child);
+    }
+
+    Ok(children)
 }
 
-/// spawn adapter sidecar 并把 child handle 存进 AdapterState。
+/// spawn adapter sidecars 并把 child handles 存进 AdapterState。
 /// 在启动 + 重启路径里复用，集中处理"无法 spawn"的日志。
 fn spawn_and_track_adapters_sidecar(app: &AppHandle) {
-    match start_adapters_sidecar(app) {
-        Ok(child) => {
+    match start_adapters_sidecars(app) {
+        Ok(children) => {
             if let Some(state) = app.try_state::<AdapterState>() {
                 if let Ok(mut guard) = state.0.lock() {
-                    *guard = Some(child);
+                    *guard = children;
                 }
             }
         }
@@ -1048,8 +1634,41 @@ fn stop_adapters_sidecar(app: &AppHandle) {
     let Ok(mut guard) = state.0.lock() else {
         return;
     };
-    if let Some(child) = guard.take() {
+    for child in guard.drain(..) {
         let _ = child.kill();
+    }
+}
+
+#[cfg(unix)]
+fn kill_stale_unix_adapter_sidecars() {
+    let current_pid = std::process::id();
+    let Ok(output) = StdCommand::new("ps")
+        .args(["-axo", "pid=,command="])
+        .output()
+    else {
+        return;
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let mut parts = line.trim_start().splitn(2, char::is_whitespace);
+        let Some(pid_text) = parts.next() else {
+            continue;
+        };
+        let Some(command) = parts.next() else {
+            continue;
+        };
+        let Ok(pid) = pid_text.parse::<u32>() else {
+            continue;
+        };
+        if pid == current_pid {
+            continue;
+        }
+        if !command.contains("claude-sidecar") || !command.contains(" adapters") {
+            continue;
+        }
+
+        let _ = StdCommand::new("kill").arg(pid.to_string()).status();
     }
 }
 
@@ -1072,10 +1691,11 @@ fn kill_windows_sidecars() {
 mod tests {
     use super::{
         decode_terminal_output, default_utf8_locale, ensure_utf8_locale,
-        has_meaningful_intersection, is_persistable_window_state, parse_env_block,
-        StoredWindowState,
+        has_meaningful_intersection, is_persistable_window_state, normalize_terminal_bash_path,
+        parse_env_block, run_notification_bridge, select_h5_dist_dir, StoredWindowState,
+        SERVER_BIND_HOST, SERVER_CONTROL_HOST,
     };
-    use std::collections::HashMap;
+    use std::{collections::HashMap, fs};
 
     #[test]
     fn window_state_rejects_too_small_sizes() {
@@ -1174,6 +1794,48 @@ mod tests {
     }
 
     #[test]
+    fn terminal_bash_path_normalizer_clears_blank_values() {
+        assert_eq!(
+            normalize_terminal_bash_path(Some("   ".to_string())).expect("blank path clears"),
+            None
+        );
+        assert_eq!(
+            normalize_terminal_bash_path(None).expect("missing path clears"),
+            None
+        );
+    }
+
+    #[test]
+    fn terminal_bash_path_normalizer_rejects_missing_files() {
+        let missing = std::env::temp_dir().join(format!(
+            "cchh-missing-bash-{}",
+            std::process::id()
+        ));
+
+        let error = normalize_terminal_bash_path(Some(missing.to_string_lossy().to_string()))
+            .expect_err("missing path should be rejected");
+
+        assert!(error.contains("terminal bash path does not exist"));
+    }
+
+    #[test]
+    fn terminal_bash_path_normalizer_accepts_existing_files() {
+        let path = std::env::temp_dir().join(format!(
+            "cchh-bash-path-test-{}",
+            std::process::id()
+        ));
+        fs::write(&path, "").expect("write bash path fixture");
+
+        assert_eq!(
+            normalize_terminal_bash_path(Some(format!("  {}  ", path.display())))
+                .expect("existing file is accepted"),
+            Some(path.to_string_lossy().to_string())
+        );
+
+        fs::remove_file(path).expect("remove bash path fixture");
+    }
+
+    #[test]
     fn terminal_environment_forces_utf8_locale_when_shell_uses_c_locale() {
         let mut env = HashMap::from([
             ("LANG".to_string(), "C".to_string()),
@@ -1211,11 +1873,54 @@ mod tests {
         assert_eq!(env.get("LC_CTYPE").map(String::as_str), Some("en_US.UTF8"));
         assert_eq!(env.get("LC_ALL").map(String::as_str), Some("C.UTF-8"));
     }
+
+    #[test]
+    fn server_sidecar_binds_lan_but_reports_loopback_control_url() {
+        assert_eq!(SERVER_BIND_HOST, "0.0.0.0");
+        assert_eq!(SERVER_CONTROL_HOST, "127.0.0.1");
+    }
+
+    #[test]
+    fn h5_dist_dir_prefers_tauri_parent_resource_mapping() {
+        let root = std::env::temp_dir().join(format!(
+            "cchh-h5-dist-test-{}",
+            std::process::id()
+        ));
+        let resource_dir = root.join("Contents").join("Resources");
+        let app_root = root.join("Contents").join("MacOS");
+        let mapped_dist = resource_dir.join("_up_").join("dist");
+
+        fs::create_dir_all(&mapped_dist).expect("create mapped dist dir");
+        fs::create_dir_all(&app_root).expect("create app root dir");
+        fs::write(mapped_dist.join("index.html"), "").expect("write h5 shell");
+
+        assert_eq!(
+            select_h5_dist_dir(Some(&resource_dir), &app_root),
+            mapped_dist
+        );
+
+        fs::remove_dir_all(root).expect("remove temp app tree");
+    }
+
+    #[test]
+    fn notification_bridge_runs_off_the_calling_thread() {
+        let caller_thread = std::thread::current().id();
+        let ran_on_worker = tauri::async_runtime::block_on(run_notification_bridge(move || {
+            Ok(std::thread::current().id() != caller_thread)
+        }))
+        .expect("notification bridge operation should complete");
+
+        assert!(ran_on_worker);
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default()
+        // Keep this first so duplicate launches are stopped before sidecars start.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main_window(app);
+        }))
         .manage(ServerState::default())
         .manage(AdapterState::default())
         .manage(TerminalState::default())
@@ -1223,15 +1928,27 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             get_server_url,
             restart_adapters_sidecar,
             prepare_for_update_install,
+            cancel_update_install,
             terminal_spawn,
             terminal_write,
             terminal_resize,
-            terminal_kill
+            terminal_kill,
+            get_terminal_bash_path,
+            set_terminal_bash_path,
+            macos_notification_permission_state,
+            macos_request_notification_permission,
+            macos_send_notification,
+            open_windows_notification_settings,
+            get_app_mode,
+            set_app_mode,
+            detect_portable_dir,
+            set_app_zoom
         ]);
 
     // macOS: native menu bar (traffic-light overlay style)
@@ -1296,6 +2013,7 @@ pub fn run() {
     let app = builder
         .setup(|app| {
             setup_system_tray(app)?;
+            macos_notifications::install_click_handler(app.handle().clone());
             restore_main_window_state(&app.handle());
 
             let state = app.state::<ServerState>();

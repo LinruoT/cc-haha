@@ -9,8 +9,7 @@
 import { ProviderService } from './providerService.js'
 import { SettingsService } from './settingsService.js'
 import { sessionService } from './sessionService.js'
-import { PROVIDER_PRESETS } from '../config/providerPresets.js'
-import { isEnvTruthy } from '../../utils/envUtils.js'
+import { cleanSessionTitleSource, hasSessionTitleMarkup } from '../../utils/sessionTitleText.js'
 
 const TITLE_MAX_LEN = 50
 
@@ -33,7 +32,7 @@ Bad (wrong case): {"title": "Fix Login Button On Mobile"}`
  * Returns first sentence, collapsed to single line, max 50 chars.
  */
 export function deriveTitle(raw: string): string | undefined {
-  const clean = raw.replace(/<[^>]+>[^<]*<\/[^>]+>/g, '').trim()
+  const clean = cleanSessionTitleSource(raw)
   const firstSentence = /^(.*?[.!?。！？])\s/.exec(clean)?.[1] ?? clean
   const flat = firstSentence.replace(/\s+/g, ' ').trim()
   if (!flat) return undefined
@@ -50,7 +49,7 @@ export async function generateTitle(
   conversationText: string,
   providerId?: string | null,
 ): Promise<string | null> {
-  const trimmed = conversationText.trim()
+  const trimmed = cleanSessionTitleSource(conversationText)
   if (!trimmed) return null
 
   try {
@@ -72,7 +71,7 @@ export async function generateTitle(
 
     const model = resolvedProvider.models.haiku || resolvedProvider.models.main
     const url = `${resolvedProvider.baseUrl.replace(/\/+$/, '')}/v1/messages`
-    const shouldDisableThinking = await shouldDisableThinkingForTitle(resolvedProvider.presetId)
+    const shouldDisableThinking = await shouldDisableThinkingForTitle()
 
     const response = await fetch(url, {
       method: 'POST',
@@ -99,26 +98,86 @@ export async function generateTitle(
     const text = body.content?.find((b) => b.type === 'text')?.text
     if (!text) return null
 
-    // Parse JSON response
-    const match = text.match(/\{[^}]*"title"\s*:\s*"([^"]+)"[^}]*\}/)
-    if (match?.[1]) return match[1].trim()
-
-    // Fallback: if model returned plain text instead of JSON
-    const plain = text.trim()
-    if (plain.length > 0 && plain.length <= 60) return plain
-
-    return null
+    return parseGeneratedTitleText(text)
   } catch {
     return null
   }
 }
 
-async function shouldDisableThinkingForTitle(presetId: string): Promise<boolean> {
-  const settings = await new SettingsService().getUserSettings()
-  if (settings.alwaysThinkingEnabled !== false) return false
+export function parseGeneratedTitleText(text: string): string | null {
+  const trimmed = text.trim()
+  if (!trimmed) return null
 
-  const presetEnv = PROVIDER_PRESETS.find((preset) => preset.id === presetId)?.defaultEnv
-  return isEnvTruthy(presetEnv?.CC_HAHA_SEND_DISABLED_THINKING)
+  const parsed = parseTitleFromStructuredText(trimmed)
+  if (parsed) return normalizeTitle(parsed)
+
+  if (looksLikeStructuredTitleFragment(trimmed)) return null
+
+  return normalizeTitle(trimmed)
+}
+
+function parseTitleFromStructuredText(text: string): string | null {
+  const candidates = new Set<string>([text])
+  const fenced = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i)?.[1]?.trim()
+  if (fenced) candidates.add(fenced)
+
+  const firstBrace = text.indexOf('{')
+  const lastBrace = text.lastIndexOf('}')
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    candidates.add(text.slice(firstBrace, lastBrace + 1))
+  }
+
+  for (const candidate of [...candidates]) {
+    const unescaped = candidate.replace(/\\"/g, '"').replace(/\\n/g, '\n')
+    if (unescaped !== candidate) candidates.add(unescaped)
+  }
+
+  for (const candidate of candidates) {
+    const title = parseTitleJson(candidate)
+    if (title) return title
+  }
+
+  return null
+}
+
+function parseTitleJson(candidate: string): string | null {
+  try {
+    const parsed = JSON.parse(candidate)
+    if (typeof parsed === 'string') {
+      return parseTitleFromStructuredText(parsed)
+    }
+    if (parsed && typeof parsed === 'object' && typeof (parsed as { title?: unknown }).title === 'string') {
+      return (parsed as { title: string }).title
+    }
+  } catch {
+    return null
+  }
+  return null
+}
+
+function normalizeTitle(title: string): string | null {
+  const clean = cleanSessionTitleSource(title)
+  if (
+    !clean ||
+    clean.length > 60 ||
+    looksLikeStructuredTitleFragment(clean) ||
+    hasSessionTitleMarkup(clean)
+  ) return null
+  return clean
+}
+
+function looksLikeStructuredTitleFragment(text: string): boolean {
+  return (
+    text.includes('```') ||
+    text.includes('{') ||
+    text.includes('}') ||
+    /\\?"title\\?"\s*:/.test(text)
+  )
+}
+
+async function shouldDisableThinkingForTitle(): Promise<boolean> {
+  const settings = await new SettingsService().getUserSettings()
+  return settings.alwaysThinkingEnabled === false
 }
 
 /**

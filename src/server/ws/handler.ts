@@ -21,9 +21,11 @@ import { diagnosticsService } from '../services/diagnosticsService.js'
 import { deriveTitle, generateTitle, saveAiTitle } from '../services/titleService.js'
 import { parseSlashCommand } from '../../utils/slashCommandParsing.js'
 import {
+  COMMAND_NAME_TAG,
   LOCAL_COMMAND_STDERR_TAG,
   LOCAL_COMMAND_STDOUT_TAG,
 } from '../../constants/xml.js'
+import { shouldCreateWorktreeForSessionLaunch } from '../services/repositoryLaunchService.js'
 
 const settingsService = new SettingsService()
 const providerService = new ProviderService()
@@ -31,7 +33,13 @@ const providerService = new ProviderService()
 /**
  * Cache slash commands from CLI init messages, keyed by sessionId.
  */
-const sessionSlashCommands = new Map<string, Array<{ name: string; description: string }>>()
+export type SessionSlashCommand = {
+  name: string
+  description: string
+  argumentHint?: string
+}
+
+const sessionSlashCommands = new Map<string, SessionSlashCommand[]>()
 
 /**
  * Timers for delayed session cleanup after client disconnect.
@@ -53,6 +61,7 @@ const sessionTitleState = new Map<string, {
   hasCustomTitle: boolean
   firstUserMessage: string
   allUserMessages: string[]
+  startedGenerationCounts: Set<number>
 }>()
 
 const runtimeOverrides = new Map<string, {
@@ -68,7 +77,23 @@ const prewarmedSessions = new Set<string>()
 const prewarmIdleTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const DEFAULT_PREWARM_IDLE_TIMEOUT_MS = 5 * 60_000
 
-export function getSlashCommands(sessionId: string): Array<{ name: string; description: string }> {
+async function sendRepositoryStartupStatus(
+  ws: ServerWebSocket<WebSocketData>,
+  sessionId: string,
+  reason: 'user_message' | 'prewarm_session',
+): Promise<void> {
+  if (reason !== 'user_message') return
+
+  const launchInfo = await sessionService.getSessionLaunchInfo(sessionId).catch(() => null)
+  const repository = launchInfo?.repository
+  if (!repository) return
+
+  if (shouldCreateWorktreeForSessionLaunch(launchInfo)) {
+    sendMessage(ws, { type: 'status', state: 'thinking', verb: 'Creating worktree' })
+  }
+}
+
+export function getSlashCommands(sessionId: string): SessionSlashCommand[] {
   return sessionSlashCommands.get(sessionId) || []
 }
 
@@ -163,7 +188,7 @@ export const handleWebSocket = {
           break
 
         case 'prewarm_session':
-          handlePrewarmSession(ws)
+          void handlePrewarmSession(ws)
           break
 
         case 'stop_generation':
@@ -192,6 +217,10 @@ export const handleWebSocket = {
     }
 
     console.log(`[WS] Client disconnected from session: ${sessionId} (${code}: ${reason})`)
+    if (activeSessions.get(sessionId) !== ws) {
+      console.log(`[WS] Ignoring stale client disconnect for session: ${sessionId}`)
+      return
+    }
     computerUseApprovalService.cancelSession(sessionId)
     activeSessions.delete(sessionId)
     conversationService.clearOutputCallbacks(sessionId)
@@ -247,28 +276,32 @@ async function handleUserMessage(
   // Send thinking status
   sendMessage(ws, { type: 'status', state: 'thinking', verb: 'Thinking' })
 
-  const pendingRuntimeTransition = runtimeTransitionPromises.get(sessionId)
-  if (pendingRuntimeTransition) {
-    try {
-      await pendingRuntimeTransition
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err)
-      void diagnosticsService.recordEvent({
-        type: 'runtime_transition_failed',
-        severity: 'error',
-        sessionId,
-        summary: errMsg,
-        details: err,
-      })
-      console.error(`[WS] Runtime transition failed before handling user message for ${sessionId}: ${errMsg}`)
-      sendMessage(ws, {
-        type: 'error',
-        message: `Failed to switch provider/model: ${errMsg}`,
-        code: 'CLI_RESTART_FAILED',
-      })
-      sendMessage(ws, { type: 'status', state: 'idle' })
-      return
+  const initialRuntimeTransition = await waitForRuntimeTransitionBeforeUserTurn(ws, sessionId)
+  if (!initialRuntimeTransition.ok) return
+  if (initialRuntimeTransition.waited) {
+    sendMessage(ws, { type: 'status', state: 'thinking', verb: 'Thinking' })
+  }
+
+  // Track and emit the first placeholder title before CLI startup/streaming.
+  let titleState = sessionTitleState.get(sessionId)
+  if (!titleState) {
+    titleState = {
+      userMessageCount: 0,
+      hasCustomTitle: !!(await sessionService.getCustomTitle(sessionId)),
+      firstUserMessage: '',
+      allUserMessages: [],
+      startedGenerationCounts: new Set<number>(),
     }
+    sessionTitleState.set(sessionId, titleState)
+  }
+  const titleInput = getTitleInputForUserMessage(message.content, desktopSlashCommand)
+  if (titleInput) {
+    titleState.userMessageCount++
+    titleState.allUserMessages.push(titleInput)
+    if (titleState.userMessageCount === 1) {
+      titleState.firstUserMessage = titleInput
+    }
+    triggerTitleGeneration(ws, sessionId)
   }
 
   // 启动 CLI 子进程（如果还没有）
@@ -290,30 +323,29 @@ async function handleUserMessage(
     return
   }
 
-  // Track user message for title generation
-  let titleState = sessionTitleState.get(sessionId)
-  if (!titleState) {
-    titleState = {
-      userMessageCount: 0,
-      hasCustomTitle: !!(await sessionService.getCustomTitle(sessionId)),
-      firstUserMessage: '',
-      allUserMessages: [],
+  const startupRuntimeTransition = await waitForRuntimeTransitionBeforeUserTurn(ws, sessionId)
+  if (startupRuntimeTransition.ok) {
+    if (startupRuntimeTransition.waited) {
+      sendMessage(ws, { type: 'status', state: 'thinking', verb: 'Thinking' })
     }
-    sessionTitleState.set(sessionId, titleState)
-  }
-  titleState.userMessageCount++
-  titleState.allUserMessages.push(message.content)
-  if (titleState.userMessageCount === 1) {
-    titleState.firstUserMessage = message.content
+  } else {
+    return
   }
 
   // Register the callback before sending the turn so startup errors are not lost.
   // Keep output muted until the current user turn is enqueued to avoid forwarding
   // any pre-turn SDK chatter as fresh chat history.
   let userMessageSent = false
+  const shouldForwardCurrentTurnLocalCommand =
+    createCurrentTurnLocalCommandForwarder(desktopSlashCommand)
 
   rebindSessionOutput(sessionId, ws, {
-    shouldForward: (cliMsg) => userMessageSent || (cliMsg.type === 'result' && cliMsg.is_error),
+    shouldForward: (cliMsg) => {
+      if (userMessageSent || (cliMsg.type === 'result' && cliMsg.is_error)) {
+        return true
+      }
+      return shouldForwardCurrentTurnLocalCommand(cliMsg)
+    },
   })
 
   const sent = conversationService.sendMessage(
@@ -370,9 +402,15 @@ async function handleDesktopClearCommand(
   })
 }
 
-function handlePrewarmSession(ws: ServerWebSocket<WebSocketData>) {
+async function handlePrewarmSession(ws: ServerWebSocket<WebSocketData>) {
   const { sessionId } = ws.data
   if (conversationService.hasSession(sessionId) || sessionStartupPromises.has(sessionId)) {
+    return
+  }
+
+  const launchInfo = await sessionService.getSessionLaunchInfo(sessionId).catch(() => null)
+  if (launchInfo?.repository) {
+    console.log(`[WS] Skipping prewarm for pending repository launch session ${sessionId}`)
     return
   }
 
@@ -440,7 +478,9 @@ function handleSetPermissionMode(
     (message.mode === 'bypassPermissions' || conversationService.getSessionPermissionMode(sessionId) === 'bypassPermissions')
 
   if (needsRestart) {
-    void restartSessionWithPermissionMode(ws, sessionId, message.mode)
+    void enqueueRuntimeTransition(sessionId, () =>
+      restartSessionWithPermissionMode(ws, sessionId, message.mode),
+    )
     return
   }
 
@@ -510,8 +550,6 @@ async function restartSessionWithPermissionMode(
   mode: string,
 ): Promise<void> {
   try {
-    sendMessage(ws, { type: 'status', state: 'thinking', verb: 'Restarting session with new permissions...' })
-
     // Persist the new mode first so it's read on restart
     await settingsService.setPermissionMode(mode)
 
@@ -554,12 +592,6 @@ async function restartSessionWithRuntimeConfig(
   sessionId: string,
 ): Promise<void> {
   try {
-    sendMessage(ws, {
-      type: 'status',
-      state: 'thinking',
-      verb: 'Switching provider and model...',
-    })
-
     const workDir = conversationService.getSessionWorkDir(sessionId)
     conversationService.stopSession(sessionId)
 
@@ -627,6 +659,8 @@ function triggerTitleGeneration(ws: ServerWebSocket<WebSocketData>, sessionId: s
 
   // Generate on count 1 (first response) and count 3 (with more context)
   if (count !== 1 && count !== 3) return
+  if (state.startedGenerationCounts.has(count)) return
+  state.startedGenerationCounts.add(count)
 
   const text = count === 1
     ? state.firstUserMessage
@@ -675,11 +709,16 @@ function triggerTitleGeneration(ws: ServerWebSocket<WebSocketData>, sessionId: s
  */
 type SessionStreamState = {
   hasReceivedStreamEvents: boolean
-  activeBlockTypes: Map<number, 'text' | 'tool_use'>
+  activeBlockTypes: Map<number, 'text' | 'tool_use' | 'thinking'>
   activeToolBlocks: Map<number, { toolName: string; toolUseId: string; inputJson: string }>
+  pendingLocalCommand?: { name: string; args: string }
   /** Tool blocks whose input JSON failed to parse in content_block_stop.
    *  The assistant message carries the complete input — defer to that. */
   pendingToolBlocks: Map<string, { toolName: string; toolUseId: string; parentToolUseId?: string }>
+  lastApiError?: {
+    message: string
+    code: string
+  }
 }
 
 const sessionStreamStates = new Map<string, SessionStreamState>()
@@ -691,7 +730,9 @@ function getStreamState(sessionId: string): SessionStreamState {
       hasReceivedStreamEvents: false,
       activeBlockTypes: new Map(),
       activeToolBlocks: new Map(),
+      pendingLocalCommand: undefined,
       pendingToolBlocks: new Map(),
+      lastApiError: undefined,
     }
     sessionStreamStates.set(sessionId, state)
   }
@@ -753,12 +794,43 @@ function markPrewarmed(sessionId: string) {
 
 function cacheSessionInitMetadata(sessionId: string, cliMsg: any) {
   if (cliMsg?.type !== 'system' || cliMsg.subtype !== 'init') return
-  if (cliMsg.slash_commands && Array.isArray(cliMsg.slash_commands)) {
-    sessionSlashCommands.set(sessionId, cliMsg.slash_commands.map((cmd: any) => ({
-      name: typeof cmd === 'string' ? cmd : (cmd.name || cmd.command || ''),
-      description: typeof cmd === 'string' ? '' : (cmd.description || ''),
-    })))
+  if (typeof cliMsg.cwd === 'string' && cliMsg.cwd.trim()) {
+    conversationService.updateSessionWorkDir(sessionId, cliMsg.cwd)
+    void (async () => {
+      await sessionService.appendSessionMetadata(sessionId, {
+        workDir: cliMsg.cwd,
+      })
+      await sessionService.deletePlaceholderSessionFiles(sessionId, cliMsg.cwd)
+    })()
   }
+  if (cliMsg.slash_commands && Array.isArray(cliMsg.slash_commands)) {
+    updateSessionSlashCommands(sessionId, cliMsg.slash_commands, { notifyClient: false })
+  }
+}
+
+function extractAssistantText(cliMsg: any): string {
+  const content = cliMsg?.message?.content
+  if (!Array.isArray(content)) return ''
+  const textBlock = content.find(
+    (block: unknown): block is { type: string; text: string } =>
+      !!block &&
+      typeof block === 'object' &&
+      (block as { type?: unknown }).type === 'text' &&
+      typeof (block as { text?: unknown }).text === 'string',
+  )
+  return textBlock?.text || ''
+}
+
+function isDuplicateOfLastApiError(
+  lastApiError: SessionStreamState['lastApiError'],
+  resultMessage: string,
+): boolean {
+  if (!lastApiError?.message) return false
+  if (resultMessage === lastApiError.message) return true
+  return (
+    resultMessage.includes(lastApiError.message) &&
+    /CLI (?:process exited unexpectedly|exited during startup)/i.test(resultMessage)
+  )
 }
 
 function bindPrewarmMetadataCapture(sessionId: string) {
@@ -813,6 +885,7 @@ async function ensureCliSessionStarted(
     const sdkUrl =
       `ws://${ws.data.serverHost}:${ws.data.serverPort}/sdk/${sessionId}` +
       `?token=${encodeURIComponent(crypto.randomUUID())}`
+    await sendRepositoryStartupStatus(ws, sessionId, reason)
     console.log(`[WS] Starting CLI for ${sessionId} due to ${reason}`)
     await conversationService.startSession(sessionId, workDir, sdkUrl, runtimeSettings)
   })()
@@ -827,15 +900,18 @@ async function ensureCliSessionStarted(
   }
 }
 
-function translateCliMessage(cliMsg: any, sessionId: string): ServerMessage[] {
+export function translateCliMessage(cliMsg: any, sessionId: string): ServerMessage[] {
   const streamState = getStreamState(sessionId)
   switch (cliMsg.type) {
     case 'assistant': {
-      if (cliMsg.error) {
+      if (cliMsg.error || cliMsg.isApiErrorMessage) {
+        const message = extractAssistantText(cliMsg) || cliMsg.error || 'Unknown API error'
+        const code = typeof cliMsg.error === 'string' ? cliMsg.error : 'API_ERROR'
+        streamState.lastApiError = { message, code }
         return [{
           type: 'error',
-          message: cliMsg.message?.content?.[0]?.text || cliMsg.error,
-          code: cliMsg.error,
+          message,
+          code,
         }]
       }
 
@@ -899,8 +975,22 @@ function translateCliMessage(cliMsg: any, sessionId: string): ServerMessage[] {
         cliMsg.message?.content,
       )
       if (localCommandOutput) {
-        messages.push({ type: 'content_start', blockType: 'text' })
-        messages.push({ type: 'content_delta', text: localCommandOutput })
+        const goalEvent = extractGoalEvent(
+          localCommandOutput,
+          streamState.pendingLocalCommand,
+        )
+        streamState.pendingLocalCommand = undefined
+        if (goalEvent) {
+          messages.push({
+            type: 'system_notification',
+            subtype: 'goal_event',
+            message: goalEvent.message,
+            data: goalEvent,
+          })
+        } else {
+          messages.push({ type: 'content_start', blockType: 'text' })
+          messages.push({ type: 'content_delta', text: localCommandOutput })
+        }
       }
 
       if (cliMsg.message?.content && Array.isArray(cliMsg.message.content)) {
@@ -930,7 +1020,7 @@ function translateCliMessage(cliMsg: any, sessionId: string): ServerMessage[] {
 
       switch (event.type) {
         case 'message_start': {
-          return [{ type: 'status', state: 'streaming' }]
+          return [{ type: 'status', state: 'thinking' }]
         }
 
         case 'content_block_start': {
@@ -938,9 +1028,9 @@ function translateCliMessage(cliMsg: any, sessionId: string): ServerMessage[] {
           if (!contentBlock) return []
 
           const index = event.index ?? 0
-          streamState.activeBlockTypes.set(index, contentBlock.type === 'tool_use' ? 'tool_use' : 'text')
 
           if (contentBlock.type === 'tool_use') {
+            streamState.activeBlockTypes.set(index, 'tool_use')
             // Track tool info so content_block_stop can emit complete data
             streamState.activeToolBlocks.set(index, {
               toolName: contentBlock.name || '',
@@ -958,6 +1048,13 @@ function translateCliMessage(cliMsg: any, sessionId: string): ServerMessage[] {
                   : undefined,
             }]
           }
+
+          if (contentBlock.type === 'thinking' || contentBlock.type === 'redacted_thinking') {
+            streamState.activeBlockTypes.set(index, 'thinking')
+            return [{ type: 'status', state: 'thinking', verb: 'Thinking' }]
+          }
+
+          streamState.activeBlockTypes.set(index, 'text')
           return [{ type: 'content_start', blockType: 'text' }]
         }
 
@@ -1078,6 +1175,10 @@ function translateCliMessage(cliMsg: any, sessionId: string): ServerMessage[] {
           (Array.isArray(cliMsg.errors) && cliMsg.errors.length > 0
             ? cliMsg.errors.join('\n')
             : 'Unknown error')
+        if (isDuplicateOfLastApiError(streamState.lastApiError, resultMessage)) {
+          streamState.lastApiError = undefined
+          return [{ type: 'message_complete', usage }]
+        }
         // 错误和完成消息都发送
         return [
           {
@@ -1091,6 +1192,7 @@ function translateCliMessage(cliMsg: any, sessionId: string): ServerMessage[] {
 
       // Clear stop flag on successful completion too
       sessionStopRequested.delete(sessionId)
+      streamState.lastApiError = undefined
       return [{ type: 'message_complete', usage }]
     }
 
@@ -1118,16 +1220,47 @@ function translateCliMessage(cliMsg: any, sessionId: string): ServerMessage[] {
         }
         return messages
       }
+      if (subtype === 'memory_saved') {
+        return [{
+          type: 'system_notification',
+          subtype: 'memory_saved',
+          message: cliMsg.message,
+          data: {
+            writtenPaths: Array.isArray(cliMsg.writtenPaths) ? cliMsg.writtenPaths : [],
+            teamCount: typeof cliMsg.teamCount === 'number' ? cliMsg.teamCount : undefined,
+            verb: typeof cliMsg.verb === 'string' ? cliMsg.verb : undefined,
+          },
+        }]
+      }
       if (subtype === 'hook_started' || subtype === 'hook_response') {
         // Hook 执行中 — 不转发给前端
         return []
       }
       if (subtype === 'local_command' || subtype === 'local_command_output') {
+        const localCommand = extractLocalCommand(cliMsg.content ?? cliMsg.message)
+        if (localCommand) {
+          streamState.pendingLocalCommand = localCommand
+          return []
+        }
+
         const localCommandOutput = extractLocalCommandOutput(
           cliMsg.content ?? cliMsg.message,
           { allowUntagged: subtype === 'local_command_output' },
         )
         if (!localCommandOutput) return []
+        const goalEvent = extractGoalEvent(
+          localCommandOutput,
+          streamState.pendingLocalCommand,
+        )
+        streamState.pendingLocalCommand = undefined
+        if (goalEvent) {
+          return [{
+            type: 'system_notification',
+            subtype: 'goal_event',
+            message: goalEvent.message,
+            data: goalEvent,
+          }]
+        }
         return [
           { type: 'content_start', blockType: 'text' },
           { type: 'content_delta', text: localCommandOutput },
@@ -1143,18 +1276,34 @@ function translateCliMessage(cliMsg: any, sessionId: string): ServerMessage[] {
         }]
       }
       if (subtype === 'task_started') {
-        return [{
-          type: 'status',
-          state: 'tool_executing',
-          verb: cliMsg.message || 'Task started',
-        }]
+        return [
+          {
+            type: 'system_notification',
+            subtype: 'task_started',
+            message: cliMsg.message || cliMsg.description || 'Task started',
+            data: cliMsg,
+          },
+          {
+            type: 'status',
+            state: 'tool_executing',
+            verb: cliMsg.message || cliMsg.description || 'Task started',
+          },
+        ]
       }
       if (subtype === 'task_progress') {
-        return [{
-          type: 'status',
-          state: 'tool_executing',
-          verb: cliMsg.message || 'Task in progress',
-        }]
+        return [
+          {
+            type: 'system_notification',
+            subtype: 'task_progress',
+            message: cliMsg.message || cliMsg.summary || cliMsg.description || 'Task in progress',
+            data: cliMsg,
+          },
+          {
+            type: 'status',
+            state: 'tool_executing',
+            verb: cliMsg.message || cliMsg.summary || cliMsg.description || 'Task in progress',
+          },
+        ]
       }
       if (subtype === 'session_state_changed') {
         return [{
@@ -1201,6 +1350,77 @@ function getDesktopSlashCommand(content: string): ReturnType<typeof parseSlashCo
   return parsed
 }
 
+function getTitleInputForUserMessage(
+  content: string,
+  command: ReturnType<typeof parseSlashCommand>,
+): string | null {
+  if (command?.commandName !== 'goal') return content
+
+  const args = command.args.trim()
+  if (!args || args === 'clear') return null
+  return args
+}
+
+export function createCurrentTurnLocalCommandForwarder(
+  command: ReturnType<typeof parseSlashCommand>,
+): (cliMsg: any) => boolean {
+  let awaitingCurrentTurnLocalCommandOutput = false
+
+  return (cliMsg: any) => {
+    if (command && isMatchingCurrentTurnLocalCommand(cliMsg, command)) {
+      awaitingCurrentTurnLocalCommandOutput = true
+      return true
+    }
+    if (command?.commandName === 'goal' && isLocalCommandOutputMessage(cliMsg)) {
+      const output = extractLocalCommandOutput(
+        cliMsg.content ?? cliMsg.message,
+        { allowUntagged: cliMsg.subtype === 'local_command_output' },
+      )
+      if (output && looksLikeGoalCommandOutput(output)) {
+        awaitingCurrentTurnLocalCommandOutput = false
+        return true
+      }
+    }
+    if (
+      awaitingCurrentTurnLocalCommandOutput &&
+      isLocalCommandOutputMessage(cliMsg)
+    ) {
+      awaitingCurrentTurnLocalCommandOutput = false
+      return true
+    }
+    return false
+  }
+}
+
+function isMatchingCurrentTurnLocalCommand(
+  cliMsg: any,
+  command: NonNullable<ReturnType<typeof parseSlashCommand>>,
+): boolean {
+  if (cliMsg?.type !== 'system' || cliMsg?.subtype !== 'local_command') {
+    return false
+  }
+  const localCommand = extractLocalCommand(cliMsg.content ?? cliMsg.message)
+  if (!localCommand) return false
+  return (
+    localCommand.name === command.commandName &&
+    localCommand.args.trim() === command.args.trim()
+  )
+}
+
+function isLocalCommandOutputMessage(cliMsg: any): boolean {
+  if (
+    cliMsg?.type !== 'system' ||
+    (cliMsg?.subtype !== 'local_command' &&
+      cliMsg?.subtype !== 'local_command_output')
+  ) {
+    return false
+  }
+  return extractLocalCommandOutput(
+    cliMsg.content ?? cliMsg.message,
+    { allowUntagged: cliMsg.subtype === 'local_command_output' },
+  ) !== null
+}
+
 function extractLocalCommandOutput(
   content: unknown,
   options: { allowUntagged?: boolean } = {},
@@ -1236,6 +1456,80 @@ function extractLocalCommandOutput(
 function extractTaggedContent(raw: string, tag: string): string | null {
   const match = raw.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`))
   return match?.[1]?.trim() ?? null
+}
+
+function extractLocalCommand(content: unknown): { name: string; args: string } | null {
+  const raw = typeof content === 'string'
+    ? content
+    : Array.isArray(content)
+      ? content
+        .flatMap((block) => {
+          if (!block || typeof block !== 'object') return []
+          const text = (block as { text?: unknown }).text
+          return typeof text === 'string' ? [text] : []
+        })
+        .join('\n')
+      : ''
+
+  const name = extractTaggedContent(raw, COMMAND_NAME_TAG)
+  if (!name) return null
+  return {
+    name: name.replace(/^\//, ''),
+    args: extractTaggedContent(raw, 'command-args') ?? '',
+  }
+}
+
+type GoalEventData = {
+  action: 'created' | 'replaced' | 'status' | 'paused' | 'resumed' | 'completed' | 'cleared' | 'message'
+  status?: string
+  objective?: string
+  budget?: string
+  elapsed?: string
+  continuations?: string
+  message?: string
+}
+
+function extractGoalEvent(
+  output: string,
+  command?: { name: string; args: string },
+): GoalEventData | null {
+  if (command && command.name !== 'goal') return null
+
+  const trimmed = output.trim()
+  if (!trimmed) return null
+
+  if (trimmed === 'Goal cleared.' || trimmed.startsWith('Goal cleared:')) {
+    return { action: 'cleared', message: trimmed }
+  }
+  if (trimmed === 'Goal marked complete.') {
+    return { action: 'completed', message: trimmed }
+  }
+  if (trimmed === 'No active goal.') {
+    return { action: 'message', message: trimmed }
+  }
+
+  if (trimmed.startsWith('Goal set:')) {
+    const objective = trimmed.slice('Goal set:'.length).trim()
+    return {
+      action: 'created',
+      status: 'active',
+      objective: objective || undefined,
+      message: trimmed,
+    }
+  }
+
+  return command?.name === 'goal' ? { action: 'message', message: trimmed } : null
+}
+
+function looksLikeGoalCommandOutput(output: string): boolean {
+  const trimmed = output.trim()
+  return (
+    trimmed.startsWith('Goal set:') ||
+    trimmed.startsWith('Goal cleared:') ||
+    trimmed === 'Goal cleared.' ||
+    trimmed === 'Goal marked complete.' ||
+    trimmed === 'No active goal.'
+  )
 }
 
 function getCompactBoundaryMessage(cliMsg: any): string {
@@ -1442,6 +1736,45 @@ function enqueueRuntimeTransition(
   return next
 }
 
+async function waitForRuntimeTransitionBeforeUserTurn(
+  ws: ServerWebSocket<WebSocketData>,
+  sessionId: string,
+): Promise<{ ok: boolean; waited: boolean }> {
+  let waited = false
+  let pendingRuntimeTransition = runtimeTransitionPromises.get(sessionId)
+  while (pendingRuntimeTransition) {
+    waited = true
+    try {
+      await pendingRuntimeTransition
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err)
+      void diagnosticsService.recordEvent({
+        type: 'runtime_transition_failed',
+        severity: 'error',
+        sessionId,
+        summary: errMsg,
+        details: err,
+      })
+      console.error(`[WS] Runtime transition failed before handling user message for ${sessionId}: ${errMsg}`)
+      sendMessage(ws, {
+        type: 'error',
+        message: `Failed to switch provider/model: ${errMsg}`,
+        code: 'CLI_RESTART_FAILED',
+      })
+      sendMessage(ws, { type: 'status', state: 'idle' })
+      return { ok: false, waited }
+    }
+
+    const nextTransition = runtimeTransitionPromises.get(sessionId)
+    pendingRuntimeTransition =
+      nextTransition && nextTransition !== pendingRuntimeTransition
+        ? nextTransition
+        : undefined
+  }
+
+  return { ok: true, waited }
+}
+
 /**
  * Send a message to a specific session's WebSocket (for use by services)
  */
@@ -1452,6 +1785,81 @@ export function sendToSession(sessionId: string, message: ServerMessage): boolea
   return true
 }
 
+export function updateSessionSlashCommands(
+  sessionId: string,
+  commands: unknown[],
+  options: { notifyClient?: boolean } = {},
+): SessionSlashCommand[] {
+  const normalized = commands
+    .map(normalizeSessionSlashCommand)
+    .filter((command): command is SessionSlashCommand => command !== null)
+
+  sessionSlashCommands.set(sessionId, normalized)
+
+  if (options.notifyClient !== false) {
+    sendToSession(sessionId, {
+      type: 'system_notification',
+      subtype: 'slash_commands',
+      data: normalized,
+    })
+  }
+
+  return normalized
+}
+
+function normalizeSessionSlashCommand(command: unknown): SessionSlashCommand | null {
+  if (typeof command === 'string') {
+    return command.trim() ? { name: command, description: '' } : null
+  }
+  if (!command || typeof command !== 'object') return null
+
+  const record = command as {
+    name?: unknown
+    command?: unknown
+    description?: unknown
+    argumentHint?: unknown
+  }
+  const name =
+    typeof record.name === 'string'
+      ? record.name
+      : typeof record.command === 'string'
+        ? record.command
+        : ''
+  if (!name.trim()) return null
+
+  return {
+    name,
+    description: typeof record.description === 'string' ? record.description : '',
+    ...(typeof record.argumentHint === 'string' ? { argumentHint: record.argumentHint } : {}),
+  }
+}
+
+export function closeSessionConnection(sessionId: string, reason = 'session closed'): boolean {
+  const cleanupTimer = sessionCleanupTimers.get(sessionId)
+  if (cleanupTimer) {
+    clearTimeout(cleanupTimer)
+    sessionCleanupTimers.delete(sessionId)
+  }
+  computerUseApprovalService.cancelSession(sessionId)
+  conversationService.clearOutputCallbacks(sessionId)
+  cleanupSessionRuntimeState(sessionId)
+
+  const ws = activeSessions.get(sessionId)
+  if (!ws) return false
+
+  activeSessions.delete(sessionId)
+  ws.close(1000, reason)
+  return true
+}
+
 export function getActiveSessionIds(): string[] {
   return Array.from(activeSessions.keys())
+}
+
+export function __resetWebSocketHandlerStateForTests(): void {
+  for (const timer of sessionCleanupTimers.values()) clearTimeout(timer)
+  for (const timer of prewarmIdleTimers.values()) clearTimeout(timer)
+  activeSessions.clear()
+  sessionCleanupTimers.clear()
+  prewarmIdleTimers.clear()
 }

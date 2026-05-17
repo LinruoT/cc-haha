@@ -2,11 +2,12 @@
  * Unit tests for Settings, Models, and Status APIs
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
+import { describe, it, expect, beforeAll, beforeEach, afterEach, spyOn } from 'bun:test'
 import * as fs from 'fs/promises'
 import * as path from 'path'
 import * as os from 'os'
 import { SettingsService } from '../services/settingsService.js'
+import { conversationService } from '../services/conversationService.js'
 import { handleSettingsApi } from '../api/settings.js'
 import { handleModelsApi } from '../api/models.js'
 import { handleStatusApi, resetUsage, addUsage } from '../api/status.js'
@@ -21,6 +22,11 @@ import {
 } from '../../utils/secureStorage/macOsKeychainHelpers.js'
 import type { OpenAIOAuthTokens } from '../../services/openaiAuth/types.js'
 import { getModelOptions } from '../../utils/model/modelOptions.js'
+import {
+  getSettingsForSource,
+  updateSettingsForSource,
+} from '../../utils/settings/settings.js'
+import { resetSettingsCache } from '../../utils/settings/settingsCache.js'
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -40,6 +46,7 @@ let originalAnthropicDefaultOpusModel: string | undefined
 
 async function setup() {
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-test-'))
+  resetSettingsCache()
   originalConfigDir = process.env.CLAUDE_CONFIG_DIR
   originalHome = process.env.HOME
   originalUserProfile = process.env.USERPROFILE
@@ -72,6 +79,7 @@ async function teardown() {
   plainTextStorage.delete()
   clearKeychainCache()
   clearOpenAIOAuthTokenCache()
+  resetSettingsCache()
 
   if (originalConfigDir !== undefined) {
     process.env.CLAUDE_CONFIG_DIR = originalConfigDir
@@ -184,6 +192,17 @@ describe('SettingsService', () => {
     expect(settings).toEqual({})
   })
 
+  it('should recover from malformed user settings after an upgrade', async () => {
+    await fs.writeFile(path.join(tmpDir, 'settings.json'), '{not json', 'utf-8')
+
+    const svc = new SettingsService()
+    const settings = await svc.getUserSettings()
+    const files = await fs.readdir(tmpDir)
+
+    expect(settings).toEqual({})
+    expect(files.some((name) => name.startsWith('settings.json.invalid-'))).toBe(true)
+  })
+
   it('should write and read user settings', async () => {
     const svc = new SettingsService()
     await svc.updateUserSettings({ theme: 'dark', model: 'claude-opus-4-7' })
@@ -191,6 +210,14 @@ describe('SettingsService', () => {
     const settings = await svc.getUserSettings()
     expect(settings.theme).toBe('dark')
     expect(settings.model).toBe('claude-opus-4-7')
+  })
+
+  it('should write and read the pure white theme setting', async () => {
+    const svc = new SettingsService()
+    await svc.updateUserSettings({ theme: 'white' })
+
+    const settings = await svc.getUserSettings()
+    expect(settings.theme).toBe('white')
   })
 
   it('should merge settings on update (shallow merge)', async () => {
@@ -201,6 +228,37 @@ describe('SettingsService', () => {
     const settings = await svc.getUserSettings()
     expect(settings.theme).toBe('dark')
     expect(settings.model).toBe('claude-haiku-4-5')
+  })
+
+  it('should not let cached CLI settings overwrite desktop settings updates', async () => {
+    const svc = new SettingsService()
+    await svc.updateUserSettings({
+      enabledPlugins: {
+        'demo@test-market': false,
+      },
+    })
+
+    expect(getSettingsForSource('userSettings')?.enabledPlugins?.['demo@test-market']).toBe(false)
+
+    await svc.updateUserSettings({
+      language: 'chinese',
+      desktopNotificationsEnabled: true,
+      alwaysThinkingEnabled: false,
+    })
+
+    const { error } = updateSettingsForSource('userSettings', {
+      enabledPlugins: {
+        ...getSettingsForSource('userSettings')?.enabledPlugins,
+        'demo@test-market': true,
+      },
+    })
+    expect(error).toBeNull()
+
+    const settings = await svc.getUserSettings()
+    expect(settings.language).toBe('chinese')
+    expect(settings.desktopNotificationsEnabled).toBe(true)
+    expect(settings.alwaysThinkingEnabled).toBe(false)
+    expect((settings.enabledPlugins as Record<string, unknown>)['demo@test-market']).toBe(true)
   })
 
   it('should read and write project settings', async () => {
@@ -232,6 +290,19 @@ describe('SettingsService', () => {
   it('should get default permission mode', async () => {
     const svc = new SettingsService()
     const mode = await svc.getPermissionMode()
+    expect(mode).toBe('default')
+  })
+
+  it('should ignore stale invalid permission modes from older installs', async () => {
+    await fs.writeFile(
+      path.join(tmpDir, 'settings.json'),
+      JSON.stringify({ defaultMode: 'legacy-yolo' }),
+      'utf-8',
+    )
+
+    const svc = new SettingsService()
+    const mode = await svc.getPermissionMode()
+
     expect(mode).toBe('default')
   })
 
@@ -322,6 +393,28 @@ describe('Settings API', () => {
     const res2 = await handleSettingsApi(r2, u2, s2)
     const body2 = await res2.json()
     expect(body2.model).toBe('claude-opus-4-7')
+  })
+
+  it('PUT /api/settings/user should sync thinking changes to active CLI sessions', async () => {
+    const syncSpy = spyOn(conversationService, 'setMaxThinkingTokensForActiveSessions')
+      .mockImplementation(() => 0)
+
+    try {
+      const disabled = makeRequest('PUT', '/api/settings/user', {
+        alwaysThinkingEnabled: false,
+      })
+      expect((await handleSettingsApi(disabled.req, disabled.url, disabled.segments)).status).toBe(200)
+
+      const enabled = makeRequest('PUT', '/api/settings/user', {
+        alwaysThinkingEnabled: true,
+      })
+      expect((await handleSettingsApi(enabled.req, enabled.url, enabled.segments)).status).toBe(200)
+
+      expect(syncSpy).toHaveBeenNthCalledWith(1, 0)
+      expect(syncSpy).toHaveBeenNthCalledWith(2, null)
+    } finally {
+      syncSpy.mockRestore()
+    }
   })
 
   it('GET /api/settings/cli-launcher should expose bundled launcher status', async () => {
@@ -542,6 +635,19 @@ describe('Models API', () => {
     expect(body.available).toEqual(['low', 'medium', 'high', 'max'])
   })
 
+  it('GET /api/effort should fall back when stored effort is stale', async () => {
+    const settingsSvc = new SettingsService()
+    await settingsSvc.updateUserSettings({ effort: 'turbo' })
+
+    const { req, url, segments } = makeRequest('GET', '/api/effort')
+    const res = await handleModelsApi(req, url, segments)
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.level).toBe('medium')
+    expect(body.available).toEqual(['low', 'medium', 'high', 'max'])
+  })
+
   it('PUT /api/effort should set effort level', async () => {
     const { req, url, segments } = makeRequest('PUT', '/api/effort', { level: 'high' })
     const res = await handleModelsApi(req, url, segments)
@@ -663,5 +769,61 @@ describe('Status API', () => {
     const { req, url, segments } = makeRequest('GET', '/api/status/nonexistent')
     const res = await handleStatusApi(req, url, segments)
     expect(res.status).toBe(404)
+  })
+})
+
+// =============================================================================
+// Activity Stats API
+// =============================================================================
+
+describe('Activity Stats API', () => {
+  let handleApiRequest: typeof import('../router.js').handleApiRequest
+
+  beforeAll(async () => {
+    ;({ handleApiRequest } = await import('../router.js'))
+  })
+
+  beforeEach(async () => {
+    await setup()
+  })
+
+  afterEach(teardown)
+
+  it('GET /api/activity-stats should default to the all range', async () => {
+    const { req, url } = makeRequest('GET', '/api/activity-stats')
+    const res = await handleApiRequest(req, url)
+
+    expect(res.status).toBe(200)
+
+    const body = await res.json()
+    expect(body.range).toBe('all')
+    expect(body.stats.totalSessions).toBe(0)
+    expect(new Date(body.generatedAt).toString()).not.toBe('Invalid Date')
+  })
+
+  it('GET /api/activity-stats/:range should return stats for supported ranges', async () => {
+    for (const range of ['7d', '30d', 'all'] as const) {
+      const { req, url } = makeRequest('GET', `/api/activity-stats/${range}`)
+      const res = await handleApiRequest(req, url)
+
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body.range).toBe(range)
+      expect(body.stats).toBeDefined()
+    }
+  })
+
+  it('should reject non-GET methods', async () => {
+    const { req, url } = makeRequest('POST', '/api/activity-stats')
+    const res = await handleApiRequest(req, url)
+
+    expect(res.status).toBe(405)
+  })
+
+  it('should reject unknown activity stats ranges', async () => {
+    const { req, url } = makeRequest('GET', '/api/activity-stats/90d')
+    const res = await handleApiRequest(req, url)
+
+    expect(res.status).toBe(400)
   })
 })

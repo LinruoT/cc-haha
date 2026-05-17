@@ -32,11 +32,11 @@ type Translate = ReturnType<typeof useTranslation>
 function toneForStatus(status: McpServerRecord['status']) {
   switch (status) {
     case 'connected':
-      return 'bg-emerald-500/10 text-emerald-600 border-emerald-500/20'
+      return 'bg-[var(--color-inspector-success-bg)] text-[var(--color-inspector-success)] border-[var(--color-inspector-border)]'
     case 'needs-auth':
-      return 'bg-amber-500/10 text-amber-600 border-amber-500/20'
+      return 'bg-[var(--color-surface-container-low)] text-[var(--color-warning)] border-[var(--color-border)]'
     case 'failed':
-      return 'bg-rose-500/10 text-rose-600 border-rose-500/20'
+      return 'bg-[var(--color-inspector-danger-bg)] text-[var(--color-inspector-danger)] border-[var(--color-inspector-border)]'
     case 'disabled':
       return 'bg-[var(--color-surface-hover)] text-[var(--color-text-secondary)] border-[var(--color-border)]'
     default:
@@ -114,7 +114,7 @@ function EmptyState({ title, body }: { title: string; body: string }) {
 
 function ErrorState({ message }: { message: string }) {
   return (
-    <div className="rounded-2xl border border-[var(--color-error)]/20 bg-[var(--color-error)]/8 px-5 py-4 text-sm text-[var(--color-error)]">
+    <div className="rounded-2xl border border-[var(--color-inspector-border)] bg-[var(--color-inspector-panel)] px-5 py-4 text-sm text-[var(--color-inspector-danger)]">
       {message}
     </div>
   )
@@ -270,7 +270,7 @@ function UsageTab({
         </div>
       )}
       {usage.hasUnknownModelCost && (
-        <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 px-4 py-3 text-sm text-amber-700">
+        <div className="rounded-xl border border-[var(--color-inspector-border)] bg-[var(--color-inspector-panel)] px-4 py-3 text-sm text-[var(--color-warning)]">
           {t('slash.inspector.usage.unknownCost')}
         </div>
       )}
@@ -297,7 +297,14 @@ function UsageTab({
             {models.map((model) => (
               <div key={model.model} className="border-t border-[var(--color-inspector-border)] first:border-t-0">
                 <div className="grid grid-cols-[minmax(0,1fr)_120px] items-center gap-4 border-b border-[var(--color-inspector-border)] px-4 py-3">
-                  <div className="min-w-0 truncate text-[13px] font-semibold text-[var(--color-inspector-text)]">{model.displayName || model.model}</div>
+                  <div className="min-w-0">
+                    <div className="truncate text-[13px] font-semibold text-[var(--color-inspector-text)]">{model.displayName || model.model}</div>
+                    {(model.contextWindow > 0 || context?.rawMaxTokens) && (
+                      <div className="mt-1 truncate text-[11px] text-[var(--color-inspector-muted)]">
+                        {t('slash.inspector.status.contextWindow')}: {formatNumber(model.contextWindow || context?.rawMaxTokens)}
+                      </div>
+                    )}
+                  </div>
                   <div className="text-right text-[12px] font-semibold uppercase tracking-[0.18em] text-[var(--color-inspector-heading)]">{t('slash.inspector.usage.tokens')}</div>
                 </div>
                 <div className="grid grid-cols-[160px_minmax(0,1fr)_120px] items-center gap-4 border-b border-[var(--color-inspector-border)] px-4 py-3 last:border-b-0">
@@ -324,6 +331,7 @@ function UsageTab({
 }
 
 type ContextCategory = SessionContextSnapshot['categories'][number]
+type ContextMemoryFile = SessionContextSnapshot['memoryFiles'][number]
 
 function isCapacityCategory(category: ContextCategory) {
   const name = category.name.toLowerCase()
@@ -393,6 +401,75 @@ function CategoryBreakdown({ categories, rawMaxTokens, t }: { categories: Contex
             </div>
           )
         })}
+      </div>
+    </div>
+  )
+}
+
+function memoryContextFileLabel(path: string) {
+  const normalized = path.replace(/\\/g, '/')
+  return normalized.split('/').pop() || normalized
+}
+
+function MemoryFilesBreakdown({ files, t }: { files: ContextMemoryFile[]; t: Translate }) {
+  const setPendingSettingsTab = useUIStore((state) => state.setPendingSettingsTab)
+  const setPendingMemoryPath = useUIStore((state) => state.setPendingMemoryPath)
+  const openSettings = (path?: string) => {
+    if (path) setPendingMemoryPath(path)
+    setPendingSettingsTab('memory')
+    useTabStore.getState().openTab(SETTINGS_TAB_ID, 'Settings', 'settings')
+  }
+
+  if (files.length === 0) {
+    return (
+      <div className="rounded-md border border-[var(--color-inspector-border)] bg-[var(--color-inspector-panel)] px-5 py-5">
+        <div className="flex items-center justify-between gap-3">
+          <InspectorSectionTitle>{t('slash.inspector.context.memoryFiles')}</InspectorSectionTitle>
+          <button
+            type="button"
+            onClick={() => openSettings()}
+            className="rounded-sm border border-[var(--color-inspector-border)] bg-[var(--color-inspector-chip)] px-2.5 py-1 text-xs font-semibold text-[var(--color-inspector-muted-strong)] hover:text-[var(--color-inspector-text)]"
+          >
+            {t('slash.inspector.context.openMemory')}
+          </button>
+        </div>
+        <div className="mt-4 text-sm text-[var(--color-inspector-muted)]">{t('slash.inspector.context.noMemoryFiles')}</div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="rounded-md border border-[var(--color-inspector-border)] bg-[var(--color-inspector-panel)] px-5 py-5">
+      <div className="flex items-center justify-between gap-3">
+        <InspectorSectionTitle>{t('slash.inspector.context.memoryFiles')}</InspectorSectionTitle>
+        <button
+          type="button"
+          onClick={() => openSettings(files[0]?.path)}
+          className="rounded-sm border border-[var(--color-inspector-border)] bg-[var(--color-inspector-chip)] px-2.5 py-1 text-xs font-semibold text-[var(--color-inspector-muted-strong)] hover:text-[var(--color-inspector-text)]"
+        >
+          {t('slash.inspector.context.openMemory')}
+        </button>
+      </div>
+      <div className="mt-4 grid gap-2">
+        {files.map((file) => (
+          <div
+            key={`${file.type}:${file.path}`}
+            className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 rounded-md border border-[var(--color-inspector-border)] bg-[var(--color-inspector-surface)] px-3 py-2"
+          >
+            <div className="min-w-0">
+              <div className="truncate font-mono text-sm font-semibold text-[var(--color-inspector-text)]" title={file.path}>
+                {memoryContextFileLabel(file.path)}
+              </div>
+              <div className="mt-0.5 truncate font-mono text-[11px] text-[var(--color-inspector-muted)]" title={file.path}>
+                {file.path}
+              </div>
+            </div>
+            <div className="shrink-0 text-right font-mono">
+              <div className="text-xs font-semibold uppercase tracking-[0.12em] text-[var(--color-inspector-muted-strong)]">{file.type}</div>
+              <div className="mt-0.5 text-[11px] text-[var(--color-inspector-muted)]">{formatNumber(file.tokens)} tokens</div>
+            </div>
+          </div>
+        ))}
       </div>
     </div>
   )
@@ -502,6 +579,7 @@ function ContextTab({
   return (
     <div className="space-y-6">
       <ContextOverview context={context} categories={categories} t={t} />
+      <MemoryFilesBreakdown files={Array.isArray(context.memoryFiles) ? context.memoryFiles : []} t={t} />
       <CategoryBreakdown categories={categories} rawMaxTokens={context.rawMaxTokens} t={t} />
     </div>
   )
@@ -518,7 +596,9 @@ function StatusTab({
 }) {
   const mcpServers = Array.isArray(data.status.mcpServers) ? data.status.mcpServers : []
   const tools = Array.isArray(data.status.tools) ? data.status.tools : []
-  const model = data.status.model ?? data.context?.model ?? data.usage?.models?.[0]?.displayName ?? data.usage?.models?.[0]?.model ?? t('slash.inspector.status.unknown')
+  const context = data.context ?? data.contextEstimate
+  const model = data.status.model ?? context?.model ?? data.usage?.models?.[0]?.displayName ?? data.usage?.models?.[0]?.model ?? t('slash.inspector.status.unknown')
+  const contextWindow = context?.rawMaxTokens ?? data.usage?.models?.find((entry) => entry.contextWindow > 0)?.contextWindow
   const slashCommandCount = (data.status.slashCommandCount ?? 0) > 0
     ? data.status.slashCommandCount
     : commands?.length ?? 0
@@ -536,7 +616,11 @@ function StatusTab({
             </span>
           )}
         />
-        <MetricCard label={t('slash.inspector.status.activeModel')} value={model} />
+        <MetricCard
+          label={t('slash.inspector.status.activeModel')}
+          value={model}
+          detail={contextWindow ? `${t('slash.inspector.status.contextWindow')}: ${formatNumber(contextWindow)}` : undefined}
+        />
         <MetricCard
           label={t('slash.inspector.status.mcpConnections')}
           value={(
@@ -580,9 +664,7 @@ function StatusTab({
             {mcpServers.map((server) => (
               <div
                 key={`${server.name}:${server.status}`}
-                className={`flex min-h-[48px] items-center justify-between gap-4 rounded-md border px-4 py-3 font-mono ${
-                  server.status === 'failed' ? 'border-[var(--color-inspector-danger-border)] bg-[var(--color-inspector-danger-surface)]' : 'border-[var(--color-inspector-border)] bg-[var(--color-inspector-panel)]'
-                }`}
+                className="flex min-h-[48px] items-center justify-between gap-4 rounded-md border border-[var(--color-inspector-border)] bg-[var(--color-inspector-panel)] px-4 py-3 font-mono"
               >
                 <div className="flex min-w-0 items-center gap-3">
                   <McpServerIcon status={server.status} />
@@ -704,7 +786,7 @@ function SessionInspectorPanel({
     let cancelled = false
     setContextLoading(true)
     setContextError(null)
-    sessionsApi.getInspection(sessionId, { includeContext: true, timeout: 45_000 })
+    sessionsApi.getInspection(sessionId, { includeContext: true, contextOnly: true, timeout: 45_000 })
       .then((response) => {
         if (cancelled) return
         const inspected = assertSessionInspectionResponse(response, t)
@@ -744,7 +826,7 @@ function SessionInspectorPanel({
       ) : data === null ? (
         <LoadingState label={t('slash.inspector.loading')} />
       ) : selectedTab === 'usage' ? (
-        <UsageTab usage={data.usage} context={data.context} error={data.errors?.usage} t={t} />
+        <UsageTab usage={data.usage} context={data.context ?? data.contextEstimate} error={data.errors?.usage} t={t} />
       ) : selectedTab === 'context' ? (
         <ContextTab
           context={data.context ?? data.contextEstimate}
@@ -976,7 +1058,12 @@ function HelpPanel({
 
   const renderCommand = (command: SlashCommandOption) => (
     <div key={command.name} className="flex min-w-0 items-start gap-3 border-t border-[var(--color-border)] px-4 py-3 first:border-t-0">
-      <div className="shrink-0 font-mono text-sm font-semibold text-[var(--color-text-primary)]">/{command.name}</div>
+      <div className="flex min-w-[120px] max-w-[45%] shrink-0 flex-wrap items-baseline gap-x-1.5 font-mono">
+        <span className="text-sm font-semibold text-[var(--color-text-primary)]">/{command.name}</span>
+        {command.argumentHint ? (
+          <span className="text-[11px] leading-5 text-[var(--color-text-tertiary)]">{command.argumentHint}</span>
+        ) : null}
+      </div>
       <div className="min-w-0 flex-1 text-xs leading-5 text-[var(--color-text-tertiary)]">{command.description}</div>
     </div>
   )

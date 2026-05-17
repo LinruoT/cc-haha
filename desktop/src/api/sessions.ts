@@ -7,7 +7,65 @@ type MessagesResponse = {
   messages: MessageEntry[]
   taskNotifications?: AgentTaskNotification[]
 }
-type CreateSessionResponse = { sessionId: string }
+type CreateSessionResponse = { sessionId: string; workDir?: string }
+export type BatchDeleteSessionsResponse = {
+  ok: boolean
+  successes: string[]
+  failures: Array<{
+    sessionId: string
+    message: string
+    code?: string
+  }>
+}
+export type SessionGitWorktreeInfo = {
+  enabled: boolean
+  path: string | null
+  plannedPath: string | null
+  sourceWorkDir: string | null
+  slug: string | null
+  branch: string | null
+}
+export type SessionGitInfo = {
+  branch: string | null
+  repoName: string | null
+  workDir: string
+  changedFiles: number
+  worktree: SessionGitWorktreeInfo | null
+}
+export type CreateSessionRepositoryOptions = {
+  branch?: string | null
+  worktree?: boolean
+}
+export type CreateSessionRequest = {
+  workDir?: string
+  repository?: CreateSessionRepositoryOptions
+}
+export type RepositoryBranchInfo = {
+  name: string
+  current: boolean
+  local: boolean
+  remote: boolean
+  remoteRef?: string
+  checkedOut: boolean
+  worktreePath?: string
+}
+export type RepositoryWorktreeInfo = {
+  path: string
+  branch: string | null
+  current: boolean
+}
+export type RepositoryContextResult = {
+  state: 'ok' | 'not_git_repo' | 'missing_workdir' | 'error'
+  workDir: string
+  repoRoot: string | null
+  repoName: string | null
+  currentBranch: string | null
+  defaultBranch: string | null
+  dirty: boolean
+  branches: RepositoryBranchInfo[]
+  worktrees: RepositoryWorktreeInfo[]
+  error?: string
+}
 export type SessionRewindResponse = {
   target: {
     targetUserMessageId: string
@@ -249,12 +307,19 @@ export const sessionsApi = {
     return api.get<MessagesResponse>(`/api/sessions/${sessionId}/messages`)
   },
 
-  create(workDir?: string) {
-    return api.post<CreateSessionResponse>('/api/sessions', workDir ? { workDir } : {})
+  create(input?: string | CreateSessionRequest) {
+    const body = typeof input === 'string'
+      ? (input ? { workDir: input } : {})
+      : (input ?? {})
+    return api.post<CreateSessionResponse>('/api/sessions', body)
   },
 
   delete(sessionId: string) {
     return api.delete<{ ok: true }>(`/api/sessions/${sessionId}`)
+  },
+
+  batchDelete(sessionIds: string[]) {
+    return api.post<BatchDeleteSessionsResponse>('/api/sessions/batch-delete', { sessionIds })
   },
 
   rename(sessionId: string, title: string) {
@@ -266,19 +331,29 @@ export const sessionsApi = {
     return api.get<{ projects: RecentProject[] }>(`/api/sessions/recent-projects${query}`)
   },
 
+  getRepositoryContext(workDir: string) {
+    const query = new URLSearchParams({ workDir })
+    return api.get<RepositoryContextResult>(`/api/sessions/repository-context?${query.toString()}`)
+  },
+
   getGitInfo(sessionId: string) {
-    return api.get<{ branch: string | null; repoName: string | null; workDir: string; changedFiles: number }>(`/api/sessions/${sessionId}/git-info`)
+    return api.get<SessionGitInfo>(`/api/sessions/${sessionId}/git-info`)
   },
 
   getSlashCommands(sessionId: string) {
     return api.get<{ commands: Array<{ name: string; description: string }> }>(`/api/sessions/${sessionId}/slash-commands`)
   },
 
-  getInspection(sessionId: string, options?: { includeContext?: boolean; timeout?: number }) {
-    const query = options?.includeContext === undefined
-      ? ''
-      : `?includeContext=${options.includeContext ? '1' : '0'}`
-    return api.get<SessionInspectionResponse>(`/api/sessions/${sessionId}/inspection${query}`, {
+  getInspection(sessionId: string, options?: { includeContext?: boolean; timeout?: number; contextOnly?: boolean }) {
+    const query = new URLSearchParams()
+    if (options?.includeContext !== undefined) {
+      query.set('includeContext', options.includeContext ? '1' : '0')
+    }
+    if (options?.contextOnly) {
+      query.set('contextOnly', '1')
+    }
+    const suffix = query.size > 0 ? `?${query.toString()}` : ''
+    return api.get<SessionInspectionResponse>(`/api/sessions/${sessionId}/inspection${suffix}`, {
       timeout: options?.timeout ?? (options?.includeContext ? 45_000 : 25_000),
     })
   },

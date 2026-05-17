@@ -14,9 +14,15 @@ const diagnosticsApiMock = vi.hoisted(() => ({
   clear: vi.fn(),
 }))
 
+const doctorRepairMock = vi.hoisted(() => ({
+  runDoctorRepair: vi.fn(),
+}))
+
 vi.mock('../api/diagnostics', () => ({
   diagnosticsApi: diagnosticsApiMock,
 }))
+
+vi.mock('../lib/doctorRepair', () => doctorRepairMock)
 
 vi.mock('../stores/providerStore', () => ({
   useProviderStore: () => ({
@@ -87,6 +93,7 @@ describe('Settings > Diagnostics tab', () => {
     diagnosticsApiMock.getStatus.mockResolvedValue({
       logDir: '/tmp/claude/cc-haha/diagnostics',
       diagnosticsPath: '/tmp/claude/cc-haha/diagnostics/diagnostics.jsonl',
+      cliDiagnosticsPath: '/tmp/claude/cc-haha/diagnostics/cli-diagnostics.jsonl',
       runtimeErrorsPath: '/tmp/claude/cc-haha/diagnostics/runtime-errors.log',
       exportDir: '/tmp/claude/cc-haha/diagnostics/exports',
       retentionDays: 7,
@@ -104,6 +111,10 @@ describe('Settings > Diagnostics tab', () => {
         severity: 'error',
         summary: 'CLI exited during startup with code 1',
         sessionId: 'session-1',
+        details: {
+          exitCode: 1,
+          capturedOutput: 'stderr:\nprovider rejected request',
+        },
       }],
     })
     diagnosticsApiMock.exportBundle.mockResolvedValue({
@@ -115,6 +126,17 @@ describe('Settings > Diagnostics tab', () => {
     })
     diagnosticsApiMock.openLogDir.mockResolvedValue({ ok: true })
     diagnosticsApiMock.clear.mockResolvedValue({ ok: true })
+    doctorRepairMock.runDoctorRepair.mockResolvedValue({
+      local: {
+        removedKeys: ['cc-haha-open-tabs', 'cc-haha-session-runtime'],
+        missingKeys: ['cc-haha-theme', 'cc-haha-locale', 'cc-haha.persistence.schemaVersion'],
+        failedKeys: [],
+      },
+      server: {
+        ok: true,
+      },
+      serverError: null,
+    })
 
     useSettingsStore.setState({ locale: 'en' })
     useUIStore.setState({ pendingSettingsTab: null, toasts: [] })
@@ -131,6 +153,7 @@ describe('Settings > Diagnostics tab', () => {
     expect(screen.getByRole('button', { name: /Copy Error Summary/i })).toBeInTheDocument()
     expect(screen.getByText('cli_start_failed')).toBeInTheDocument()
     expect(screen.getByText('CLI exited during startup with code 1')).toBeInTheDocument()
+    expect(screen.getByText('Details')).toBeInTheDocument()
   })
 
   it('exports a diagnostics bundle from the settings page', async () => {
@@ -159,6 +182,7 @@ describe('Settings > Diagnostics tab', () => {
         writeText: vi.fn().mockRejectedValue(new Error('clipboard blocked')),
       },
     })
+    const writeText = vi.mocked(navigator.clipboard.writeText)
 
     try {
       render(<Settings />)
@@ -169,6 +193,7 @@ describe('Settings > Diagnostics tab', () => {
       await waitFor(() => {
         expect(execCommand).toHaveBeenCalledWith('copy')
       })
+      expect(writeText).toHaveBeenCalledWith(expect.stringContaining('capturedOutput'))
       const toasts = useUIStore.getState().toasts
       expect(toasts[toasts.length - 1]?.message).toBe('Error summary copied.')
     } finally {
@@ -181,5 +206,24 @@ describe('Settings > Diagnostics tab', () => {
         value: originalClipboard,
       })
     }
+  })
+
+  it('runs Doctor from Diagnostics without clearing unrelated desktop state', async () => {
+    window.localStorage.setItem('cc-haha-open-tabs', '{"activeTabId":"__settings__"}')
+    window.localStorage.setItem('cc-haha-theme', 'dark')
+    window.localStorage.setItem('cc-haha-chat-history', 'keep')
+
+    render(<Settings />)
+
+    fireEvent.click(screen.getByText('Diagnostics'))
+    fireEvent.click(await screen.findByRole('button', { name: /Run Doctor/i }))
+
+    await waitFor(() => {
+      expect(doctorRepairMock.runDoctorRepair).toHaveBeenCalled()
+    })
+
+    const toasts = useUIStore.getState().toasts
+    expect(toasts[toasts.length - 1]?.message).toContain('Doctor')
+    expect(window.localStorage.getItem('cc-haha-chat-history')).toBe('keep')
   })
 })

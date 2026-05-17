@@ -60,6 +60,8 @@ const zhSidebar = [
     collapsed: false,
     items: [
       { text: '总览', link: '/im/' },
+      { text: '微信', link: '/im/wechat' },
+      { text: '钉钉', link: '/im/dingtalk' },
       { text: 'Telegram', link: '/im/telegram' },
       { text: '飞书', link: '/im/feishu' },
     ],
@@ -89,6 +91,7 @@ const zhSidebar = [
       { text: '架构设计', link: '/desktop/02-architecture' },
       { text: '功能详解', link: '/desktop/03-features' },
       { text: '安装与构建', link: '/desktop/04-installation' },
+      { text: 'H5 访问', link: '/desktop/06-h5-access' },
     ],
   },
   {
@@ -187,6 +190,12 @@ export default withMermaid(defineConfig({
   markdown: {
     anchor: {
       slugify,
+    },
+  },
+
+  vite: {
+    build: {
+      chunkSizeWarningLimit: 1800,
     },
   },
 

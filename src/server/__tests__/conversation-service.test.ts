@@ -8,24 +8,29 @@ import { ProviderService } from '../services/providerService.js'
 describe('ConversationService', () => {
   let tmpDir: string
   let originalConfigDir: string | undefined
+  let originalApiKey: string | undefined
   let originalAuthToken: string | undefined
   let originalBaseUrl: string | undefined
   let originalModel: string | undefined
   let originalEntrypoint: string | undefined
   let originalOAuthToken: string | undefined
   let originalProviderManagedByHost: string | undefined
+  let originalDiagnosticsFile: string | undefined
 
   beforeEach(async () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'cc-haha-conversation-service-'))
     originalConfigDir = process.env.CLAUDE_CONFIG_DIR
+    originalApiKey = process.env.ANTHROPIC_API_KEY
     originalAuthToken = process.env.ANTHROPIC_AUTH_TOKEN
     originalBaseUrl = process.env.ANTHROPIC_BASE_URL
     originalModel = process.env.ANTHROPIC_MODEL
     originalEntrypoint = process.env.CLAUDE_CODE_ENTRYPOINT
     originalOAuthToken = process.env.CLAUDE_CODE_OAUTH_TOKEN
     originalProviderManagedByHost = process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST
+    originalDiagnosticsFile = process.env.CLAUDE_CODE_DIAGNOSTICS_FILE
 
     process.env.CLAUDE_CONFIG_DIR = tmpDir
+    process.env.ANTHROPIC_API_KEY = 'stale-parent-api-key'
     process.env.ANTHROPIC_AUTH_TOKEN = 'test-token'
     process.env.ANTHROPIC_BASE_URL = 'https://example.invalid/anthropic'
     process.env.ANTHROPIC_MODEL = 'test-model'
@@ -34,11 +39,15 @@ describe('ConversationService', () => {
     // buildChildEnv injects it or not without interference from the shell env.
     delete process.env.CLAUDE_CODE_ENTRYPOINT
     delete process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST
+    delete process.env.CLAUDE_CODE_DIAGNOSTICS_FILE
   })
 
   afterEach(async () => {
     if (originalConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR
     else process.env.CLAUDE_CONFIG_DIR = originalConfigDir
+
+    if (originalApiKey === undefined) delete process.env.ANTHROPIC_API_KEY
+    else process.env.ANTHROPIC_API_KEY = originalApiKey
 
     if (originalAuthToken === undefined) delete process.env.ANTHROPIC_AUTH_TOKEN
     else process.env.ANTHROPIC_AUTH_TOKEN = originalAuthToken
@@ -58,6 +67,9 @@ describe('ConversationService', () => {
     if (originalProviderManagedByHost === undefined) delete process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST
     else process.env.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = originalProviderManagedByHost
 
+    if (originalDiagnosticsFile === undefined) delete process.env.CLAUDE_CODE_DIAGNOSTICS_FILE
+    else process.env.CLAUDE_CODE_DIAGNOSTICS_FILE = originalDiagnosticsFile
+
     await fs.rm(tmpDir, { recursive: true, force: true })
   })
 
@@ -68,6 +80,25 @@ describe('ConversationService', () => {
     expect(env.ANTHROPIC_AUTH_TOKEN).toBe('test-token')
     expect(env.ANTHROPIC_BASE_URL).toBe('https://example.invalid/anthropic')
     expect(env.ANTHROPIC_MODEL).toBe('test-model')
+    expect(env.CLAUDE_CODE_DIAGNOSTICS_FILE).toBe(path.join(tmpDir, 'cc-haha', 'diagnostics', 'cli-diagnostics.jsonl'))
+    expect(env.CLAUDE_COWORK_MEMORY_PATH_OVERRIDE).toBe(
+      `${path.join(tmpDir, 'projects', 'D--workspace-code-myself-code-cc-haha', 'memory')}${path.sep}`,
+    )
+    await expect(fs.stat(path.dirname(env.CLAUDE_CODE_DIAGNOSTICS_FILE))).resolves.toBeTruthy()
+  })
+
+  test('buildChildEnv pins desktop memory to the current sanitized project directory', async () => {
+    const service = new ConversationService() as any
+    const workDir = path.join(tmpDir, 'workspace', 'myself_code', 'claude-code-haha')
+    await fs.mkdir(workDir, { recursive: true })
+
+    const env = (await service.buildChildEnv(workDir)) as Record<string, string>
+
+    expect(env.CLAUDE_COWORK_MEMORY_PATH_OVERRIDE).toBe(
+      `${path.join(tmpDir, 'projects', sanitizeMemoryPath(workDir), 'memory')}${path.sep}`,
+    )
+    expect(env.CLAUDE_COWORK_MEMORY_PATH_OVERRIDE).toContain('myself-code')
+    expect(env.CLAUDE_COWORK_MEMORY_PATH_OVERRIDE).not.toContain('myself_code')
   })
 
   test('strips inherited provider env when desktop provider config exists', async () => {
@@ -191,7 +222,7 @@ describe('ConversationService', () => {
     expect(env.ANTHROPIC_MODEL).toBe('new-provider-sonnet')
   })
 
-  test('buildChildEnv preserves provider capability overrides from presets', async () => {
+  test('buildChildEnv clears stale api key for bearer-token providers', async () => {
     const providerService = new ProviderService()
     const provider = await providerService.addProvider({
       presetId: 'jiekouai',
@@ -214,6 +245,8 @@ describe('ConversationService', () => {
     })) as Record<string, string>
 
     expect(env.ANTHROPIC_BASE_URL).toBe('https://api.jiekou.ai/anthropic')
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe('provider-key')
+    expect(env.ANTHROPIC_API_KEY).toBe('')
     expect(env.ANTHROPIC_MODEL).toBe('claude-sonnet-4-6')
     expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES).toBe('none')
   })
@@ -332,4 +365,31 @@ describe('ConversationService', () => {
     expect(args).toContain('--effort')
     expect(args).toContain('max')
   })
+
+  test('buildSessionCliArgs starts pending desktop worktrees through the native CLI flag', () => {
+    const service = new ConversationService() as any
+    const args = service.buildSessionCliArgs(
+      '123e4567-e89b-12d3-a456-426614174000',
+      'ws://127.0.0.1:3456/sdk/test-session?token=test-token',
+      false,
+      undefined,
+      {
+        requestedWorkDir: '/tmp/source-repo',
+        repoRoot: '/tmp/source-repo',
+        branch: 'feature/rail',
+        worktree: true,
+        baseRef: 'feature/rail',
+        worktreeSlug: 'desktop-feature-rail-123e4567',
+      },
+    ) as string[]
+
+    expect(args).toContain('--worktree')
+    expect(args).toContain('desktop-feature-rail-123e4567')
+    expect(args).toContain('--worktree-base-ref')
+    expect(args).toContain('feature/rail')
+  })
 })
+
+function sanitizeMemoryPath(value: string): string {
+  return value.replace(/[^a-zA-Z0-9]/g, '-')
+}

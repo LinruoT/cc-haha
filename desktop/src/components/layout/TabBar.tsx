@@ -1,14 +1,38 @@
 import { forwardRef, useRef, useState, useEffect, useCallback } from 'react'
-import { useTabStore, type Tab } from '../../stores/tabStore'
+import {
+  SCHEDULED_TAB_ID,
+  SETTINGS_TAB_ID,
+  TERMINAL_TAB_PREFIX,
+  useTabStore,
+  type Tab,
+} from '../../stores/tabStore'
 import { useChatStore } from '../../stores/chatStore'
+import { useSessionStore } from '../../stores/sessionStore'
 import { useWorkspacePanelStore } from '../../stores/workspacePanelStore'
+import { useTerminalPanelStore } from '../../stores/terminalPanelStore'
 import { useTranslation } from '../../i18n'
 import { WindowControls, showWindowControls } from './WindowControls'
+import { OpenProjectMenu } from './OpenProjectMenu'
 import { Folder, FolderOpen, SquareTerminal } from 'lucide-react'
 
 const TAB_WIDTH = 180
 const DRAG_START_THRESHOLD = 4
 const isTauri = typeof window !== 'undefined' && ('__TAURI_INTERNALS__' in window || '__TAURI__' in window)
+
+function isSessionTab(tab: Tab | null) {
+  if (!tab) return false
+  const tabType = (tab as Partial<Tab>).type
+  if (tabType === 'session') return true
+  if (tabType) return false
+  return isSessionTabId(tab.sessionId)
+}
+
+function isSessionTabId(tabId: string | null) {
+  if (!tabId) return false
+  return tabId !== SETTINGS_TAB_ID &&
+    tabId !== SCHEDULED_TAB_ID &&
+    !tabId.startsWith(TERMINAL_TAB_PREFIX)
+}
 
 export function TabBar() {
   const tabs = useTabStore((s) => s.tabs)
@@ -17,8 +41,17 @@ export function TabBar() {
   const closeTab = useTabStore((s) => s.closeTab)
   const disconnectSession = useChatStore((s) => s.disconnectSession)
   const activeTab = tabs.find((tab) => tab.sessionId === activeTabId) ?? null
-  const isActiveSessionTab = activeTab?.type === 'session'
+  const isActiveSessionTab = isSessionTab(activeTab) || isSessionTabId(activeTabId)
+  const activeSession = useSessionStore((state) =>
+    activeTabId ? state.sessions.find((session) => session.id === activeTabId) : undefined,
+  )
+  const openProjectPath = isActiveSessionTab && activeSession?.workDirExists !== false
+    ? activeSession?.workDir ?? null
+    : null
   const isWorkspacePanelOpen = useWorkspacePanelStore((state) =>
+    activeTabId && isActiveSessionTab ? state.isPanelOpen(activeTabId) : false,
+  )
+  const isTerminalPanelOpen = useTerminalPanelStore((state) =>
     activeTabId && isActiveSessionTab ? state.isPanelOpen(activeTabId) : false,
   )
 
@@ -40,7 +73,7 @@ export function TabBar() {
 
   useEffect(() => {
     if (!isTauri) return
-    import(/* @vite-ignore */ '@tauri-apps/api/window')
+    import('@tauri-apps/api/window')
       .then(({ getCurrentWindow }) => {
         const win = getCurrentWindow()
         startDraggingRef.current = () => win.startDragging()
@@ -69,6 +102,21 @@ export function TabBar() {
   }, [updateScrollState, tabs.length])
 
   useEffect(() => {
+    if (!activeTabId) return
+    const activeTabEl = tabRefs.current.get(activeTabId)
+    if (!activeTabEl) return
+
+    activeTabEl.scrollIntoView({
+      block: 'nearest',
+      inline: 'nearest',
+      behavior: 'smooth',
+    })
+
+    const frame = window.requestAnimationFrame(updateScrollState)
+    return () => window.cancelAnimationFrame(frame)
+  }, [activeTabId, tabs.length, updateScrollState])
+
+  useEffect(() => {
     if (!contextMenu) return
     const close = () => setContextMenu(null)
     document.addEventListener('click', close)
@@ -82,8 +130,9 @@ export function TabBar() {
   }
 
   const closeTabWithCleanup = useCallback((tab: Tab) => {
-    if (tab.type === 'session') {
+    if (isSessionTab(tab)) {
       useWorkspacePanelStore.getState().clearSession(tab.sessionId)
+      useTerminalPanelStore.getState().clearSession(tab.sessionId)
     }
     closeTab(tab.sessionId)
   }, [closeTab])
@@ -92,7 +141,7 @@ export function TabBar() {
     // Special tabs can always be closed directly
     const tab = tabs.find((t) => t.sessionId === sessionId)
     if (!tab) return
-    if (tab.type !== 'session') {
+    if (!isSessionTab(tab)) {
       closeTabWithCleanup(tab)
       return
     }
@@ -118,7 +167,7 @@ export function TabBar() {
     setContextMenu(null)
     const otherTabs = tabs.filter((t) => t.sessionId !== sessionId)
     for (const tab of otherTabs) {
-      if (tab.type === 'session') disconnectSession(tab.sessionId)
+      if (isSessionTab(tab)) disconnectSession(tab.sessionId)
       closeTabWithCleanup(tab)
     }
   }
@@ -128,7 +177,7 @@ export function TabBar() {
     const idx = tabs.findIndex((t) => t.sessionId === sessionId)
     const leftTabs = tabs.slice(0, idx)
     for (const tab of leftTabs) {
-      if (tab.type === 'session') disconnectSession(tab.sessionId)
+      if (isSessionTab(tab)) disconnectSession(tab.sessionId)
       closeTabWithCleanup(tab)
     }
   }
@@ -138,7 +187,7 @@ export function TabBar() {
     const idx = tabs.findIndex((t) => t.sessionId === sessionId)
     const rightTabs = tabs.slice(idx + 1)
     for (const tab of rightTabs) {
-      if (tab.type === 'session') disconnectSession(tab.sessionId)
+      if (isSessionTab(tab)) disconnectSession(tab.sessionId)
       closeTabWithCleanup(tab)
     }
   }
@@ -146,7 +195,7 @@ export function TabBar() {
   const handleCloseAll = () => {
     setContextMenu(null)
     for (const tab of tabs) {
-      if (tab.type === 'session') disconnectSession(tab.sessionId)
+      if (isSessionTab(tab)) disconnectSession(tab.sessionId)
       closeTabWithCleanup(tab)
     }
   }
@@ -245,11 +294,11 @@ export function TabBar() {
   return (
     <div
       data-testid="tab-bar"
-      className="flex items-stretch bg-[var(--color-surface-container)] min-h-[37px] select-none border-b border-[var(--color-border)]"
+      className="flex min-h-11 items-stretch bg-[var(--color-surface-container)] select-none border-b border-[var(--color-border)]"
     >
 
       {canScrollLeft && (
-        <button onClick={() => scroll('left')} className="flex-shrink-0 w-7 h-[37px] flex items-center justify-center text-[var(--color-text-tertiary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-surface-hover)]">
+        <button onClick={() => scroll('left')} className="flex h-11 w-7 flex-shrink-0 items-center justify-center text-[var(--color-text-tertiary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)]">
           <span className="material-symbols-outlined text-[16px]">chevron_left</span>
         </button>
       )}
@@ -278,10 +327,20 @@ export function TabBar() {
       </div>
 
       <div className="flex shrink-0 items-center gap-1 border-l border-[var(--color-border)]/70 px-2">
+        {isTauri && isActiveSessionTab && (
+          <OpenProjectMenu path={openProjectPath} />
+        )}
         <ToolbarIconButton
           icon={<SquareTerminal size={17} strokeWidth={1.9} />}
           label={t('tabs.openTerminal')}
-          onClick={() => useTabStore.getState().openTerminalTab()}
+          onClick={() => {
+            if (activeTabId && isActiveSessionTab) {
+              useTerminalPanelStore.getState().togglePanel(activeTabId)
+              return
+            }
+            useTabStore.getState().openTerminalTab()
+          }}
+          active={isTerminalPanelOpen}
         />
         {isActiveSessionTab && activeTabId && (
           <ToolbarIconButton
@@ -298,12 +357,12 @@ export function TabBar() {
           data-testid="tab-bar-drag-gutter"
           data-tauri-drag-region
           aria-hidden="true"
-          className={`flex-shrink-0 min-h-[37px] ${showWindowControls ? 'w-3' : 'w-4'}`}
+          className={`min-h-11 flex-shrink-0 ${showWindowControls ? 'w-3' : 'w-4'}`}
         />
       )}
 
       {canScrollRight && (
-        <button onClick={() => scroll('right')} className="flex-shrink-0 w-7 h-[37px] flex items-center justify-center text-[var(--color-text-tertiary)] hover:text-[var(--color-text-primary)] hover:bg-[var(--color-surface-hover)]">
+        <button onClick={() => scroll('right')} className="flex h-11 w-7 flex-shrink-0 items-center justify-center text-[var(--color-text-tertiary)] hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)]">
           <span className="material-symbols-outlined text-[16px]">chevron_right</span>
         </button>
       )}
@@ -407,7 +466,7 @@ const TabItem = forwardRef<HTMLDivElement, {
       onMouseDown={onMouseDown}
       onContextMenu={onContextMenu}
       className={`
-        tab-bar-hit-area group flex-shrink-0 flex items-center gap-1.5 px-3 min-h-[37px] relative
+        tab-bar-hit-area group relative flex min-h-11 flex-shrink-0 items-center gap-1.5 px-3
         ${isDragging ? 'z-20 cursor-grabbing' : 'cursor-grab'}
         transition-[background-color,box-shadow,opacity,transform] duration-150 ease-out
         ${isActive

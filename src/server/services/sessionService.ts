@@ -11,13 +11,21 @@ import * as os from 'node:os'
 import { ApiError } from '../middleware/errorHandler.js'
 import { sanitizePath as sanitizePortablePath } from '../../utils/sessionStoragePortable.js'
 import type { FileHistorySnapshot } from '../../utils/fileHistory.js'
+import { findCanonicalGitRoot } from '../../utils/git.js'
 import { calculateUSDCost, MODEL_COSTS } from '../../utils/modelCost.js'
 import {
+  calculateCurrentContextTokenTotal,
   MODEL_CONTEXT_WINDOW_DEFAULT,
   getContextWindowForModel,
   getModelMaxOutputTokens,
 } from '../../utils/context.js'
 import { getCanonicalName } from '../../utils/model/model.js'
+import {
+  resolveSessionWorkspaceLaunch,
+  type CreateSessionRepositoryOptions,
+  type PreparedSessionWorkspace,
+} from './repositoryLaunchService.js'
+import { cleanSessionTitleSource } from '../../utils/sessionTitleText.js'
 
 // ============================================================================
 // Types
@@ -30,8 +38,20 @@ export type SessionListItem = {
   modifiedAt: string
   messageCount: number
   projectPath: string
+  projectRoot: string | null
   workDir: string | null
   workDirExists: boolean
+}
+
+export type DeleteSessionFailure = {
+  sessionId: string
+  message: string
+  code?: string
+}
+
+export type DeleteSessionsResult = {
+  successes: string[]
+  failures: DeleteSessionFailure[]
 }
 
 export type SessionDetail = SessionListItem & {
@@ -42,6 +62,8 @@ export type SessionLaunchInfo = {
   filePath: string
   projectDir: string
   workDir: string
+  repository?: PreparedSessionWorkspace['repository']
+  worktreeSession?: PersistedWorktreeSession | null
   transcriptMessageCount: number
   customTitle: string | null
 }
@@ -68,6 +90,7 @@ export type SessionTaskNotification = {
   status: 'completed' | 'failed' | 'stopped'
   summary?: string
   outputFile?: string
+  timestamp?: string
 }
 
 export type TranscriptUsageSnapshot = {
@@ -139,6 +162,8 @@ export type TranscriptContextEstimate = {
 /** Raw entry parsed from a single JSONL line */
 type RawEntry = {
   type?: string
+  subtype?: string
+  content?: unknown
   uuid?: string
   messageId?: string
   parentUuid?: string | null
@@ -171,8 +196,21 @@ type RawEntry = {
     timestamp?: string
   }
   customTitle?: string
+  worktreeSession?: PersistedWorktreeSession | null
   title?: string
   [key: string]: unknown
+}
+
+type PersistedWorktreeSession = {
+  originalCwd: string
+  worktreePath: string
+  worktreeName: string
+  worktreeBranch?: string
+  originalBranch?: string
+  originalHeadCommit?: string
+  sessionId: string
+  tmuxSessionName?: string
+  hookBased?: boolean
 }
 
 type ContentBlock = Record<string, unknown>
@@ -248,7 +286,8 @@ export class SessionService {
     entries: RawEntry[],
     fallbackProjectDir?: string,
   ): string | null {
-    for (const entry of entries) {
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const entry = entries[i]
       if (entry.type === 'session-meta' && typeof (entry as Record<string, unknown>).workDir === 'string') {
         return (entry as Record<string, unknown>).workDir as string
       }
@@ -262,6 +301,79 @@ export class SessionService {
     }
 
     return fallbackProjectDir ? this.desanitizePath(fallbackProjectDir) : null
+  }
+
+  private resolveRepositoryFromEntries(entries: RawEntry[]): PreparedSessionWorkspace['repository'] | undefined {
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const repository = (entries[i] as Record<string, unknown>)?.repository
+      if (repository && typeof repository === 'object') {
+        return repository as PreparedSessionWorkspace['repository']
+      }
+    }
+    return undefined
+  }
+
+  private resolveWorktreeSessionFromEntries(entries: RawEntry[]): PersistedWorktreeSession | null | undefined {
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const entry = entries[i]
+      if (entry?.type !== 'worktree-state') continue
+
+      const worktreeSession = entry.worktreeSession
+      if (worktreeSession === null) return null
+      if (
+        worktreeSession &&
+        typeof worktreeSession === 'object' &&
+        typeof worktreeSession.worktreePath === 'string' &&
+        typeof worktreeSession.worktreeName === 'string'
+      ) {
+        return worktreeSession
+      }
+    }
+    return undefined
+  }
+
+  private async resolveProjectRootFromEntries(
+    entries: RawEntry[],
+    workDir: string | null,
+    fallbackProjectDir?: string,
+  ): Promise<string | null> {
+    const worktreeSession = this.resolveWorktreeSessionFromEntries(entries)
+    const repository = this.resolveRepositoryFromEntries(entries)
+
+    const candidate = worktreeSession?.originalCwd ||
+      repository?.repoRoot ||
+      workDir ||
+      (fallbackProjectDir ? this.desanitizePath(fallbackProjectDir) : null)
+
+    if (!candidate) return null
+
+    const canonicalCandidate = await this.canonicalizeProjectPath(candidate)
+    const gitRoot = findCanonicalGitRoot(canonicalCandidate)
+    if (gitRoot) return gitRoot
+
+    if (workDir) {
+      const marker = `${path.sep}.claude${path.sep}worktrees${path.sep}`
+      const markerIndex = canonicalCandidate.indexOf(marker)
+      if (markerIndex > 0) return canonicalCandidate.slice(0, markerIndex)
+    }
+
+    return canonicalCandidate
+  }
+
+  private async canonicalizeProjectPath(projectPath: string): Promise<string> {
+    try {
+      return (await fs.realpath(projectPath)).normalize('NFC')
+    } catch {
+      return projectPath.normalize('NFC')
+    }
+  }
+
+  private countTranscriptMessages(entries: RawEntry[]): number {
+    return entries.filter((entry) =>
+      !entry.isMeta &&
+      !!entry.message?.role &&
+      (entry.type === 'user' || entry.type === 'assistant' || entry.type === 'system')
+    ).length
   }
 
   // --------------------------------------------------------------------------
@@ -401,7 +513,10 @@ export class SessionService {
     return match?.[1] ? this.decodeXmlText(match[1].trim()) : undefined
   }
 
-  private parseTaskNotificationContent(content: unknown): SessionTaskNotification | null {
+  private parseTaskNotificationContent(
+    content: unknown,
+    timestamp?: string,
+  ): SessionTaskNotification | null {
     const xml = this.extractTextBlocks(content)
       .map((text) => this.extractTaskNotificationXml(text))
       .find((value): value is string => value !== null)
@@ -425,6 +540,7 @@ export class SessionService {
       status,
       ...(summary ? { summary } : {}),
       ...(outputFile ? { outputFile } : {}),
+      ...(timestamp ? { timestamp } : {}),
     }
   }
 
@@ -445,6 +561,66 @@ export class SessionService {
     }
 
     return false
+  }
+
+  private isGoalLocalCommandOutput(output: string): boolean {
+    const trimmed = output.trim()
+    return (
+      trimmed.startsWith('Goal set:') ||
+      trimmed.startsWith('Goal cleared:') ||
+      trimmed === 'Goal cleared.' ||
+      trimmed === 'Goal marked complete.' ||
+      trimmed === 'No active goal.'
+    )
+  }
+
+  private isGoalLocalCommandEntry(entry: RawEntry): boolean {
+    if (
+      entry.type !== 'system' ||
+      entry.subtype !== 'local_command' ||
+      typeof entry.content !== 'string'
+    ) {
+      return false
+    }
+
+    const commandName = this.readXmlTag(entry.content, 'command-name')?.replace(/^\//, '')
+    if (commandName) return commandName === 'goal'
+
+    const output =
+      this.readXmlTag(entry.content, 'local-command-stdout') ??
+      this.readXmlTag(entry.content, 'local-command-stderr')
+    return output ? this.isGoalLocalCommandOutput(output) : false
+  }
+
+  private goalLocalCommandEntryToMessage(entry: RawEntry): MessageEntry | null {
+    if (!this.isGoalLocalCommandEntry(entry)) return null
+    return {
+      id: entry.uuid || crypto.randomUUID(),
+      type: 'system',
+      content: entry.content,
+      timestamp: entry.timestamp || new Date().toISOString(),
+      parentUuid: entry.parentUuid ?? undefined,
+      isSidechain: entry.isSidechain,
+    }
+  }
+
+  private goalCreationCommandTitle(entry: RawEntry): string | null {
+    if (
+      entry.type !== 'system' ||
+      entry.subtype !== 'local_command' ||
+      typeof entry.content !== 'string'
+    ) {
+      return null
+    }
+
+    const commandName = this.readXmlTag(entry.content, 'command-name')?.replace(/^\//, '')
+    if (commandName !== 'goal') return null
+
+    const args = this.readXmlTag(entry.content, 'command-args')?.trim()
+    if (!args || /^clear\b/i.test(args)) return null
+
+    const title = cleanSessionTitleSource(`/goal ${args}`)
+    return title ? title.length > 80 ? title.slice(0, 80) + '...' : title : null
   }
 
   private extractAgentToolUseId(entry: RawEntry): string | undefined {
@@ -671,15 +847,22 @@ export class SessionService {
       }
     }
 
-    // 2. Look for AI-generated title (written by titleService)
+    // 2. Goal sessions should keep the original objective as the stable title.
+    for (const e of entries) {
+      const goalTitle = this.goalCreationCommandTitle(e)
+      if (goalTitle) return goalTitle
+    }
+
+    // 3. Look for AI-generated title (written by titleService)
     for (let i = entries.length - 1; i >= 0; i--) {
       const e = entries[i]!
       if (e.type === 'ai-title' && e.aiTitle) {
-        return e.aiTitle as string
+        const title = cleanSessionTitleSource(String(e.aiTitle))
+        if (title) return title
       }
     }
 
-    // 3. Look for first non-meta user message as title
+    // 4. Look for first non-meta user message as title
     for (const e of entries) {
       if (e.type === 'user' && !e.isMeta && e.message?.role === 'user') {
         const content = e.message.content
@@ -693,7 +876,8 @@ export class SessionService {
           if (textBlock) text = textBlock.text as string
         }
         if (text) {
-          return text.length > 80 ? text.slice(0, 80) + '...' : text
+          const title = cleanSessionTitleSource(text)
+          if (title) return title.length > 80 ? title.slice(0, 80) + '...' : title
         }
       }
     }
@@ -777,12 +961,11 @@ export class SessionService {
    * Find the .jsonl file for a given session ID.
    * Searches across all project directories since sessions may belong to any project.
    */
-  async findSessionFile(
+  private async findSessionFiles(
     sessionId: string
-  ): Promise<{ filePath: string; projectDir: string } | null> {
-    // Validate sessionId format to prevent path traversal
+  ): Promise<Array<{ filePath: string; projectDir: string }>> {
     if (!this.isValidSessionId(sessionId)) {
-      return null
+      return []
     }
 
     const projectsDir = this.getProjectsDir()
@@ -791,20 +974,29 @@ export class SessionService {
     try {
       projectDirs = await fs.readdir(projectsDir)
     } catch {
-      return null
+      return []
     }
 
+    const matches: Array<{ filePath: string; projectDir: string; mtimeMs: number }> = []
     for (const dir of projectDirs) {
       const filePath = path.join(projectsDir, dir, `${sessionId}.jsonl`)
       try {
-        await fs.access(filePath)
-        return { filePath, projectDir: dir }
+        const stat = await fs.stat(filePath)
+        matches.push({ filePath, projectDir: dir, mtimeMs: stat.mtimeMs })
       } catch {
         continue
       }
     }
 
-    return null
+    return matches
+      .sort((a, b) => b.mtimeMs - a.mtimeMs)
+      .map(({ filePath, projectDir }) => ({ filePath, projectDir }))
+  }
+
+  async findSessionFile(
+    sessionId: string
+  ): Promise<{ filePath: string; projectDir: string } | null> {
+    return (await this.findSessionFiles(sessionId))[0] ?? null
   }
 
   private isValidSessionId(id: string): boolean {
@@ -891,12 +1083,19 @@ export class SessionService {
     if (!latest) return null
 
     const rawMaxTokens = this.getTranscriptContextWindow(latest.model)
-    const totalTokens = latest.inputTokens + latest.cacheReadInputTokens + latest.cacheCreationInputTokens
+    const promptTokens = latest.inputTokens + latest.cacheReadInputTokens + latest.cacheCreationInputTokens
+    const totalTokens = calculateCurrentContextTokenTotal(promptTokens, {
+      input_tokens: latest.inputTokens,
+      output_tokens: latest.outputTokens,
+      cache_read_input_tokens: latest.cacheReadInputTokens,
+      cache_creation_input_tokens: latest.cacheCreationInputTokens,
+    }, rawMaxTokens)
     const percentage = rawMaxTokens > 0 ? Math.round((totalTokens / rawMaxTokens) * 100) : 0
     const categories: TranscriptContextEstimate['categories'] = [
       { name: 'Input tokens', tokens: latest.inputTokens, color: '#8f3217' },
       { name: 'Cache read', tokens: latest.cacheReadInputTokens, color: '#0f5c8f' },
       { name: 'Cache write', tokens: latest.cacheCreationInputTokens, color: '#7c3aed' },
+      { name: 'Output tokens', tokens: latest.outputTokens, color: '#2f7d32' },
       { name: 'Free space', tokens: Math.max(0, rawMaxTokens - totalTokens), color: '#a1a1aa', isDeferred: true },
     ].filter((category) => category.tokens > 0)
 
@@ -1091,6 +1290,7 @@ export class SessionService {
       try {
         const entries = await this.readJsonlFile(filePath)
         const workDir = this.resolveWorkDirFromEntries(entries, projectDir)
+        const projectRoot = await this.resolveProjectRootFromEntries(entries, workDir, projectDir)
         const workDirExists = await this.pathExists(workDir)
 
         // Count transcript messages only (user + assistant)
@@ -1116,6 +1316,7 @@ export class SessionService {
           modifiedAt: stat.mtime.toISOString(),
           messageCount,
           projectPath: projectDir,
+          projectRoot,
           workDir,
           workDirExists,
         }
@@ -1146,6 +1347,7 @@ export class SessionService {
     )
     const title = this.extractTitle(entries)
     const workDir = this.resolveWorkDirFromEntries(entries, projectDir)
+    const projectRoot = await this.resolveProjectRootFromEntries(entries, workDir, projectDir)
     const workDirExists = await this.pathExists(workDir)
 
     let createdAt = stat.birthtime.toISOString()
@@ -1163,6 +1365,7 @@ export class SessionService {
       modifiedAt: stat.mtime.toISOString(),
       messageCount: messages.length,
       projectPath: projectDir,
+      projectRoot,
       workDir,
       workDirExists,
       messages,
@@ -1189,31 +1392,32 @@ export class SessionService {
   /**
    * Create a new session file for the given working directory.
    */
-  async createSession(workDir?: string): Promise<{ sessionId: string }> {
+  async createSession(
+    workDir?: string,
+    repositoryOptions?: CreateSessionRepositoryOptions,
+  ): Promise<{ sessionId: string; workDir: string }> {
     // Default to user home directory when no workDir specified
     const resolvedWorkDir = workDir || os.homedir()
+    const sessionId = crypto.randomUUID()
 
     // Resolve to absolute path. NOTE: path.resolve() uses process.cwd() to
     // expand relative paths — in bundled sidecar mode the server's cwd is
     // typically '/'. Callers (IM adapters) already send absolute realPath,
     // but we log here so cwd regressions are caught early.
-    const absWorkDir = path.resolve(resolvedWorkDir)
+    const preparedWorkspace = await resolveSessionWorkspaceLaunch(
+      resolvedWorkDir,
+      repositoryOptions,
+      sessionId,
+    )
+    const absWorkDir = preparedWorkspace.workDir
     console.log(
       `[SessionService] createSession: requested workDir=${JSON.stringify(
         workDir,
-      )}, resolved=${absWorkDir} (process.cwd()=${process.cwd()})`,
+      )}, resolved=${absWorkDir}, repository=${JSON.stringify(
+        preparedWorkspace.repository ?? null,
+      )} (process.cwd()=${process.cwd()})`,
     )
-    let stat
-    try {
-      stat = await fs.stat(absWorkDir)
-    } catch {
-      throw ApiError.badRequest(`Working directory does not exist: ${absWorkDir}`)
-    }
-    if (!stat.isDirectory()) {
-      throw ApiError.badRequest(`Working directory is not a directory: ${absWorkDir}`)
-    }
 
-    const sessionId = crypto.randomUUID()
     const sanitized = this.sanitizePath(absWorkDir)
     const dirPath = path.join(this.getProjectsDir(), sanitized)
 
@@ -1240,12 +1444,13 @@ export class SessionService {
       type: 'session-meta',
       isMeta: true,
       workDir: absWorkDir,
+      repository: preparedWorkspace.repository,
       timestamp: now,
     }
 
     await fs.writeFile(filePath, JSON.stringify(initialEntry) + '\n' + JSON.stringify(metaEntry) + '\n', 'utf-8')
 
-    return { sessionId }
+    return { sessionId, workDir: absWorkDir }
   }
 
   /**
@@ -1258,6 +1463,39 @@ export class SessionService {
     }
 
     await fs.unlink(found.filePath)
+  }
+
+  async deleteSessions(sessionIds: string[]): Promise<DeleteSessionsResult> {
+    const successes: string[] = []
+    const failures: DeleteSessionFailure[] = []
+
+    const results = await Promise.all(sessionIds.map(async (sessionId) => {
+      try {
+        await this.deleteSession(sessionId)
+        return { type: 'success' as const, sessionId }
+      } catch (error) {
+        return {
+          type: 'failure' as const,
+          sessionId,
+          message: error instanceof Error ? error.message : 'Unknown delete failure',
+          code: error instanceof ApiError ? error.code : undefined,
+        }
+      }
+    }))
+
+    for (const result of results) {
+      if (result.type === 'success') {
+        successes.push(result.sessionId)
+      } else {
+        failures.push({
+          sessionId: result.sessionId,
+          message: result.message,
+          code: result.code,
+        })
+      }
+    }
+
+    return { successes, failures }
   }
 
   /**
@@ -1344,26 +1582,23 @@ export class SessionService {
 
     const entries = await this.readJsonlFile(found.filePath)
     const workDir = this.resolveWorkDirFromEntries(entries, found.projectDir) || process.cwd()
+    const repository = this.resolveRepositoryFromEntries(entries)
+    const worktreeSession = this.resolveWorktreeSessionFromEntries(entries)
     let customTitle: string | null = null
-    let transcriptMessageCount = 0
 
     for (const entry of entries) {
       if (entry.type === 'custom-title' && typeof entry.customTitle === 'string') {
         customTitle = entry.customTitle
       }
-      if (
-        !entry.isMeta &&
-        entry.message?.role &&
-        (entry.type === 'user' || entry.type === 'assistant' || entry.type === 'system')
-      ) {
-        transcriptMessageCount++
-      }
     }
+    const transcriptMessageCount = this.countTranscriptMessages(entries)
 
     return {
       filePath: found.filePath,
       projectDir: found.projectDir,
       workDir,
+      repository,
+      worktreeSession,
       transcriptMessageCount,
       customTitle,
     }
@@ -1378,7 +1613,8 @@ export class SessionService {
   async clearSessionTranscript(sessionId: string, fallbackWorkDir?: string): Promise<void> {
     let found = await this.findSessionFile(sessionId)
     if (!found && fallbackWorkDir) {
-      const absWorkDir = path.resolve(fallbackWorkDir)
+      const resolvedPath = path.resolve(fallbackWorkDir)
+      const absWorkDir = await fs.realpath(resolvedPath).catch(() => resolvedPath)
       const dirPath = path.join(this.getProjectsDir(), this.sanitizePath(absWorkDir))
       await fs.mkdir(dirPath, { recursive: true })
       found = {
@@ -1392,6 +1628,7 @@ export class SessionService {
 
     const entries = await this.readJsonlFile(found.filePath)
     const workDir = this.resolveWorkDirFromEntries(entries, found.projectDir) || fallbackWorkDir || process.cwd()
+    const repository = this.resolveRepositoryFromEntries(entries)
     const now = new Date().toISOString()
 
     const initialEntry = {
@@ -1409,6 +1646,7 @@ export class SessionService {
       type: 'session-meta',
       isMeta: true,
       workDir,
+      repository,
       timestamp: now,
     }
 
@@ -1421,25 +1659,77 @@ export class SessionService {
 
   async appendSessionMetadata(
     sessionId: string,
-    metadata: { workDir: string; customTitle?: string | null }
+    metadata: {
+      workDir: string
+      customTitle?: string | null
+      repository?: PreparedSessionWorkspace['repository']
+    }
   ): Promise<void> {
-    const found = await this.findSessionFile(sessionId)
-    if (!found) return
+    const matches = await this.findSessionFiles(sessionId)
+    if (matches.length === 0) return
 
-    await this.appendJsonlEntry(found.filePath, {
+    let repository = metadata.repository
+    if (!repository) {
+      for (const match of matches) {
+        const candidate = this.resolveRepositoryFromEntries(await this.readJsonlFile(match.filePath))
+        if (candidate) {
+          repository = candidate
+          break
+        }
+      }
+    }
+
+    const targetProjectDir = this.sanitizePath(metadata.workDir)
+    const targetFilePath = path.join(this.getProjectsDir(), targetProjectDir, `${sessionId}.jsonl`)
+    await fs.mkdir(path.dirname(targetFilePath), { recursive: true })
+
+    await this.appendJsonlEntry(targetFilePath, {
       type: 'session-meta',
       isMeta: true,
       workDir: metadata.workDir,
+      repository,
       timestamp: new Date().toISOString(),
     })
 
     if (metadata.customTitle) {
-      await this.appendJsonlEntry(found.filePath, {
+      await this.appendJsonlEntry(targetFilePath, {
         type: 'custom-title',
         customTitle: metadata.customTitle,
         timestamp: new Date().toISOString(),
       })
     }
+  }
+
+  async deletePlaceholderSessionFiles(
+    sessionId: string,
+    keepWorkDir: string,
+  ): Promise<number> {
+    if (!this.isValidSessionId(sessionId)) return 0
+
+    const projectsDir = this.getProjectsDir()
+    let projectDirs: import('node:fs').Dirent[]
+    try {
+      projectDirs = await fs.readdir(projectsDir, { withFileTypes: true })
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return 0
+      throw err
+    }
+
+    const keepProjectDir = this.sanitizePath(keepWorkDir)
+    let removed = 0
+    for (const projectDir of projectDirs) {
+      if (!projectDir.isDirectory()) continue
+      if (projectDir.name === keepProjectDir) continue
+      const filePath = path.join(projectsDir, projectDir.name, `${sessionId}.jsonl`)
+      const entries = await this.readJsonlFile(filePath)
+      if (entries.length === 0) continue
+
+      if (this.countTranscriptMessages(entries) > 0) continue
+
+      await fs.rm(filePath, { force: true })
+      removed += 1
+    }
+    return removed
   }
 
   async trimSessionMessagesFrom(
@@ -1462,6 +1752,11 @@ export class SessionService {
     const removedMessageIds = activeMessages
       .slice(startIndex)
       .map((message) => message.id)
+    const remainingMessageIds = new Set(
+      activeMessages
+        .slice(0, startIndex)
+        .map((message) => message.id),
+    )
 
     if (removedMessageIds.length === 0) {
       return { removedCount: 0, removedMessageIds: [] }
@@ -1469,7 +1764,17 @@ export class SessionService {
 
     const removedIds = new Set(removedMessageIds)
     const filteredEntries = entries.filter(
-      (entry) => !(typeof entry.uuid === 'string' && removedIds.has(entry.uuid)),
+      (entry) => {
+        if (typeof entry.uuid !== 'string') return true
+        if (removedIds.has(entry.uuid)) return false
+        if (
+          entry.message?.role &&
+          (entry.type === 'user' || entry.type === 'assistant' || entry.type === 'system')
+        ) {
+          return remainingMessageIds.has(entry.uuid)
+        }
+        return true
+      },
     )
 
     const content =
@@ -1535,7 +1840,10 @@ export class SessionService {
     const notifications: SessionTaskNotification[] = []
     for (const entry of entries) {
       if (entry.message?.role !== 'user') continue
-      const notification = this.parseTaskNotificationContent(entry.message.content)
+      const notification = this.parseTaskNotificationContent(
+        entry.message.content,
+        entry.timestamp,
+      )
       if (notification) notifications.push(notification)
     }
     return notifications
@@ -1558,6 +1866,12 @@ export class SessionService {
     }
 
     for (const entry of entries) {
+      const goalLocalCommandMessage = this.goalLocalCommandEntryToMessage(entry)
+      if (goalLocalCommandMessage) {
+        messages.push(goalLocalCommandMessage)
+        continue
+      }
+
       // Only process transcript entries (user / assistant / system with messages)
       if (!entry.message?.role) continue
 
