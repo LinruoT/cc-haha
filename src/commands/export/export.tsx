@@ -7,15 +7,7 @@ import type { Message } from '../../types/message.js';
 import { getCwd } from '../../utils/cwd.js';
 import { renderMessagesToPlainText } from '../../utils/exportRenderer.js';
 import { writeFileSync_DEPRECATED } from '../../utils/slowOperations.js';
-function formatTimestamp(date: Date): string {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, '0');
-  const day = String(date.getDate()).padStart(2, '0');
-  const hours = String(date.getHours()).padStart(2, '0');
-  const minutes = String(date.getMinutes()).padStart(2, '0');
-  const seconds = String(date.getSeconds()).padStart(2, '0');
-  return `${year}-${month}-${day}-${hours}${minutes}${seconds}`;
-}
+import { formatTimestamp } from '../../utils/format.js';
 export function extractFirstPrompt(messages: Message[]): string {
   const firstUserMessage = messages.find(msg => msg.type === 'user');
   if (!firstUserMessage || firstUserMessage.type !== 'user') {

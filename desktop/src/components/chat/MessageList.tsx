@@ -1,4 +1,4 @@
-import { useRef, useEffect, useMemo, memo, useState, useCallback, useLayoutEffect, type ReactNode } from 'react'
+import { useRef, useEffect, useMemo, memo, useState, useCallback, useLayoutEffect, forwardRef, useImperativeHandle, type ReactNode } from 'react'
 import { ArrowDown, BookMarked, Bot, CheckCircle2, ChevronDown, ChevronRight, CircleStop, LoaderCircle, Settings, Target, XCircle } from 'lucide-react'
 import { ApiError } from '../../api/client'
 import { sessionsApi, type SessionTurnCheckpoint } from '../../api/sessions'
@@ -654,7 +654,14 @@ function getBottomScrollTop(element: HTMLElement) {
   return Math.max(0, element.scrollHeight - element.clientHeight)
 }
 
-export function MessageList({ sessionId, compact = false }: MessageListProps = {}) {
+export type MessageListHandle = {
+  scrollToMessage: (messageId: string) => void
+}
+
+export const MessageList = forwardRef<MessageListHandle, MessageListProps>(function MessageList(
+  { sessionId, compact = false }: MessageListProps = {},
+  ref,
+) {
   const activeTabId = useTabStore((s) => s.activeTabId)
   const resolvedSessionId = sessionId ?? activeTabId
   const sessionState = useChatStore((s) =>
@@ -957,6 +964,22 @@ export function MessageList({ sessionId, compact = false }: MessageListProps = {
     t,
   ])
 
+  const scrollToMessage = useCallback((messageId: string) => {
+    const container = scrollContainerRef.current
+    if (!container) return
+    const element = container.querySelector(`[data-message-id="${messageId}"]`)
+    if (!element) return
+    isProgrammaticScrollingRef.current = true
+    element.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    requestAnimationFrame(() => {
+      isProgrammaticScrollingRef.current = false
+    })
+  }, [])
+
+  useImperativeHandle(ref, () => ({
+    scrollToMessage,
+  }), [scrollToMessage])
+
   return (
     <div className="relative min-h-0 flex-1">
       <div
@@ -973,7 +996,10 @@ export function MessageList({ sessionId, compact = false }: MessageListProps = {
             const cardsForItem = turnCardsByRenderIndex.get(index) ?? []
 
             return (
-              <div key={itemKey}>
+              <div
+                key={itemKey}
+                data-message-id={item.kind !== 'tool_group' ? item.message.id : undefined}
+              >
                 {item.kind === 'tool_group' ? (
                   <ToolCallGroup
                     toolCalls={item.toolCalls}
@@ -1079,7 +1105,7 @@ export function MessageList({ sessionId, compact = false }: MessageListProps = {
       />
     </div>
   )
-}
+})
 
 export const MessageBlock = memo(function MessageBlock({
   sessionId,

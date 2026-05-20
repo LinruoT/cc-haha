@@ -98,39 +98,14 @@ const skillSearchFeatureCheck = feature('EXPERIMENTAL_SKILL_SEARCH')
 /* eslint-enable @typescript-eslint/no-require-imports */
 import type { OutputStyleConfig } from './outputStyles.js'
 import { CYBER_RISK_INSTRUCTION } from './cyberRiskInstruction.js'
-import {
-  buildZhSystemPrompt,
-  getZhIntroSection,
-  getZhSystemSection,
-  getZhDoingTasksSection,
-  getZhActionsSection,
-  getZhUsingToolsSection,
-  getZhToneAndStyleSection,
-  getZhOutputEfficiencySection,
-  getZhAgentToolSection,
-} from './zh-prompts.js'
+import { buildZhSystemPrompt, getZhAgentToolSection } from './zh-prompts.js'
 import { loadToolExperiencePrompt } from '../memdir/toolExperiences.js'
-import { shouldUseChinese } from '../utils/language.js'
+import { shouldUseChinese, localizedContent } from '../utils/language.js'
 
 export const CLAUDE_CODE_DOCS_MAP_URL =
   'https://code.claude.com/docs/en/claude_code_docs_map.md'
 
-/**
- * 判断是否应该使用中文提示词
- * 基于language设置或环境变量
- */
-export function shouldUseChinesePrompts(): boolean {
-  const settings = getInitialSettings()
-  // 检查language设置
-  if (settings.language === 'chinese' || settings.language === 'zh' || settings.language === 'zh-CN' || settings.language === '中文') {
-    return true
-  }
-  // 检查环境变量
-  if (isEnvTruthy(process.env.CLAUDE_CODE_CHINESE_PROMPTS)) {
-    return true
-  }
-  return false
-}
+export { getZhIntroSection, getZhSystemSection, getZhDoingTasksSection, getZhActionsSection, getZhUsingToolsSection, getZhToneAndStyleSection, getZhOutputEfficiencySection, getZhAgentToolSection } from './zh-prompts.js'
 
 /**
  * Boundary marker separating static (cross-org cacheable) content from dynamic content.
@@ -429,6 +404,60 @@ function getSessionSpecificGuidanceSection(
   return ['# Session-specific guidance', ...prependBullets(items)].join('\n')
 }
 
+/**
+ * 中文版会话特定指导段落
+ * 对应 getSessionSpecificGuidanceSection()，提供 Agent/Skill/搜索等中文指导
+ */
+function getZhSessionSpecificGuidanceSection(
+  enabledTools: Set<string>,
+  skillToolCommands: Command[],
+): string | null {
+  const hasAskUserQuestionTool = enabledTools.has(ASK_USER_QUESTION_TOOL_NAME)
+  const hasSkills =
+    skillToolCommands.length > 0 && enabledTools.has(SKILL_TOOL_NAME)
+  const hasAgentTool = enabledTools.has(AGENT_TOOL_NAME)
+  const searchTools = hasEmbeddedSearchTools()
+    ? `通过 ${BASH_TOOL_NAME} 工具使用 \`find\` 或 \`grep\``
+    : `${GLOB_TOOL_NAME} 或 ${GREP_TOOL_NAME}`
+
+  const items = [
+    hasAskUserQuestionTool
+      ? `如果你不理解用户为什么拒绝工具调用，使用 ${ASK_USER_QUESTION_TOOL_NAME} 工具询问他们。`
+      : null,
+    getIsNonInteractiveSession()
+      ? null
+      : `如果你需要用户自己运行 shell 命令（例如交互式登录如 \`gcloud auth login\`），建议他们在提示词中输入 \`! <command>\` —— \`!\` 前缀会在此会话中运行命令，使其输出直接进入对话。`,
+    // Agent 工具指导（含 fork subagent 中文版）
+    hasAgentTool
+      ? isForkSubagentEnabled()
+        ? `调用 ${AGENT_TOOL_NAME} 时不带 subagent_type 会创建一个 fork，它在后台运行并将工具输出排除在上下文之外——这样你可以在它工作时继续与用户聊天。当研究或多步骤实现工作会将原始输出填满上下文时使用它。**如果你是 fork**——直接执行；不要重新委派。`
+        : getZhAgentToolSection()
+      : null,
+    // 搜索工具指导
+    ...(hasAgentTool &&
+    areExplorePlanAgentsEnabled() &&
+    !isForkSubagentEnabled()
+      ? [
+          `对于简单、有目标的代码库搜索（例如搜索特定文件/类/函数），直接使用 ${searchTools}。`,
+          `对于更广泛的代码库探索和深入研究，使用 ${AGENT_TOOL_NAME} 工具，设置 subagent_type=${EXPLORE_AGENT.agentType}。这比直接使用 ${searchTools} 慢，所以仅在简单搜索不足够时使用，或当你的任务明显需要超过 ${EXPLORE_AGENT_MIN_QUERIES} 次查询时使用。`,
+        ]
+      : []),
+    // Skills 斜杠命令指导
+    hasSkills
+      ? `/<skill-name>（例如 /commit）是用户调用可调用技能的简写。执行时，技能会被展开为完整提示。使用 ${SKILL_TOOL_NAME} 工具执行它们。重要：仅对 ${SKILL_TOOL_NAME} 工具的用户可调用技能部分列出的技能使用——不要猜测或使用内置 CLI 命令。`
+      : null,
+    // Discover skills 指导
+    DISCOVER_SKILLS_TOOL_NAME !== null &&
+    hasSkills &&
+    enabledTools.has(DISCOVER_SKILLS_TOOL_NAME)
+      ? `相关技能每轮会自动显示为"与你任务相关的技能："提醒。如果你要做的事情不在其中——中途转向、不寻常的工作流程、多步骤计划——使用 ${DISCOVER_SKILLS_TOOL_NAME} 描述你正在做的事情。已显示或已加载的技能会自动过滤。如果已显示的技能已覆盖你的下一步操作，则跳过。`
+      : null,
+  ].filter(item => item !== null)
+
+  if (items.length === 0) return null
+  return ['# 会话特定指导', ...prependBullets(items)].join('\n')
+}
+
 // @[MODEL LAUNCH]: Remove this section when we launch numbat.
 function getOutputEfficiencySection(): string {
   if (process.env.USER_TYPE === 'ant') {
@@ -494,7 +523,7 @@ export async function getSystemPrompt(
   const enabledTools = new Set(tools.map(_ => _.name))
 
   // 中文提示词支持
-  if (shouldUseChinesePrompts()) {
+  if (shouldUseChinese()) {
     logForDebugging(`[SystemPrompt] path=chinese-prompts`)
     
     // 加载工具经验
@@ -503,10 +532,18 @@ export async function getSystemPrompt(
     // 构建中文系统提示词
     const zhPrompt = buildZhSystemPrompt({
       enabledTools,
-      memoryDir: undefined, // 记忆目录会在后续动态加载
       modelDescription: `你由 ${model} 模型驱动。`,
       envInfo,
     })
+
+    // 会话特定指导（Agent/Skill/搜索等中文指导）
+    const zhSessionGuidance = getZhSessionSpecificGuidanceSection(
+      enabledTools,
+      skillToolCommands,
+    )
+    if (zhSessionGuidance) {
+      zhPrompt.push(zhSessionGuidance)
+    }
 
     // 如果有工具经验，添加到提示词中
     if (toolExperiencePrompt) {
@@ -518,6 +555,35 @@ export async function getSystemPrompt(
     if (memoryPrompt) {
       zhPrompt.push(memoryPrompt)
     }
+
+    // 输出风格
+    const outputStyleSection = getOutputStyleSection(outputStyleConfig)
+    if (outputStyleSection) {
+      zhPrompt.push(outputStyleSection)
+    }
+
+    // MCP 服务器指令（非 delta 模式时添加）
+    if (!isMcpInstructionsDeltaEnabled()) {
+      const mcpSection = getMcpInstructionsSection(mcpClients)
+      if (mcpSection) {
+        zhPrompt.push(mcpSection)
+      }
+    }
+
+    // 草稿纸目录指导
+    const scratchpadSection = getScratchpadInstructions()
+    if (scratchpadSection) {
+      zhPrompt.push(scratchpadSection)
+    }
+
+    // 函数结果清理指导
+    const frcSection = getFunctionResultClearingSection(model)
+    if (frcSection) {
+      zhPrompt.push(frcSection)
+    }
+
+    // 工具结果摘要指导
+    zhPrompt.push(SUMMARIZE_TOOL_RESULTS_SECTION)
 
     // 调试：将中文提示词写入文件以便查看
     if (isEnvTruthy(process.env.DEBUG_ZH_PROMPT)) {
@@ -667,19 +733,18 @@ ${client.instructions}`
     })
     .join('\n\n')
 
-  if (shouldUseChinese()) {
-    return `# MCP服务器指令
+  return localizedContent(
+    `# MCP服务器指令
 
 以下MCP服务器提供了关于如何使用其工具和资源的指令：
 
-${instructionBlocks}`
-  }
-
-  return `# MCP Server Instructions
+${instructionBlocks}`,
+    `# MCP Server Instructions
 
 The following MCP servers have provided instructions for how to use their tools and resources:
 
-${instructionBlocks}`
+${instructionBlocks}`,
+  )
 }
 
 export async function computeEnvInfo(
@@ -733,99 +798,80 @@ export async function computeSimpleEnvInfo(
 ): Promise<string> {
   const [isGit, unameSR] = await Promise.all([getIsGit(), getUnameSR()])
 
-  // Undercover: strip all model name/ID references. See computeEnvInfo.
-  // DCE: inline the USER_TYPE check at each site — do NOT hoist to a const.
-  let modelDescription: string | null = null
-  if (process.env.USER_TYPE === 'ant' && isUndercover()) {
-    // suppress
-  } else {
+  const cwd = getCwd()
+  const isWorktree = getCurrentWorktreeSession() !== null
+  const undercover = process.env.USER_TYPE === 'ant' && isUndercover()
+
+  // Compute model label per language (fix: was computing English-only then embedding in Chinese text)
+  let modelLabel: string | null = null
+  if (!undercover) {
     const marketingName = getMarketingNameForModel(modelId)
-    modelDescription = marketingName
-      ? `You are powered by the model named ${marketingName}. The exact model ID is ${modelId}.`
-      : `You are powered by the model ${modelId}.`
+    modelLabel = localizedContent(
+      `你由 ${marketingName ?? modelId} 模型驱动。`,
+      marketingName
+        ? `You are powered by the model named ${marketingName}. The exact model ID is ${modelId}.`
+        : `You are powered by the model ${modelId}.`,
+    )
   }
 
   const cutoff = getKnowledgeCutoff(modelId)
-  const knowledgeCutoffMessage = cutoff
-    ? shouldUseChinese()
-      ? `模型知识截止日期: ${cutoff}。`
-      : `Assistant knowledge cutoff is ${cutoff}.`
-    : null
 
-  const cwd = getCwd()
-  const isWorktree = getCurrentWorktreeSession() !== null
+  const t = localizedContent(
+    {
+      envTitle: '环境信息',
+      envDesc: '你在以下环境中被调用：',
+      workingDir: '主工作目录',
+      gitRepo: '是否为git仓库',
+      gitYes: '是',
+      gitNo: '否',
+      platform: '平台',
+      osVersion: '操作系统版本',
+      additionalDirs: '额外工作目录',
+      worktreeMsg: `这是一个git工作树——仓库的隔离副本。所有命令都从这个目录运行。不要\`cd\`到原始仓库根目录。`,
+      knowledgeCutoff: (c: string) => `模型知识截止日期: ${c}。`,
+      recentModels: `最新的Claude模型系列是Claude 4.5/4.6。模型ID — Opus 4.7: '${CLAUDE_4_5_OR_4_6_MODEL_IDS.opus}', Sonnet 4.6: '${CLAUDE_4_5_OR_4_6_MODEL_IDS.sonnet}', Haiku 4.5: '${CLAUDE_4_5_OR_4_6_MODEL_IDS.haiku}'。构建AI应用时，默认使用最新、最强大的Claude模型。`,
+      availability: `Claude Code可在终端CLI、桌面应用（Mac/Windows）、Web应用（claude.ai/code）和IDE扩展（VS Code、JetBrains）中使用。`,
+      fastMode: `Claude Code的快速模式使用相同的${FRONTIER_MODEL_NAME}模型，但输出更快。它不会切换到不同的模型。可以通过 /fast 切换。`,
+    },
+    {
+      envTitle: 'Environment',
+      envDesc: 'You have been invoked in the following environment: ',
+      workingDir: 'Primary working directory',
+      gitRepo: 'Is a git repository',
+      gitYes: 'Yes',
+      gitNo: 'No',
+      platform: 'Platform',
+      osVersion: 'OS Version',
+      additionalDirs: 'Additional working directories',
+      worktreeMsg: `This is a git worktree — an isolated copy of the repository. Run all commands from this directory. Do NOT \`cd\` to the original repository root.`,
+      knowledgeCutoff: (c: string) => `Assistant knowledge cutoff is ${c}.`,
+      recentModels: `The most recent Claude model family is Claude 4.5/4.6. Model IDs — Opus 4.7: '${CLAUDE_4_5_OR_4_6_MODEL_IDS.opus}', Sonnet 4.6: '${CLAUDE_4_5_OR_4_6_MODEL_IDS.sonnet}', Haiku 4.5: '${CLAUDE_4_5_OR_4_6_MODEL_IDS.haiku}'. When building AI applications, default to the latest and most capable Claude models.`,
+      availability: `Claude Code is available as a CLI in the terminal, desktop app (Mac/Windows), web app (claude.ai/code), and IDE extensions (VS Code, JetBrains).`,
+      fastMode: `Fast mode for Claude Code uses the same ${FRONTIER_MODEL_NAME} model with faster output. It does NOT switch to a different model. It can be toggled with /fast.`,
+    },
+  )
 
-  const isZh = shouldUseChinese()
+  const envItems = [
+    `${t.workingDir}: ${cwd}`,
+    isWorktree ? t.worktreeMsg : null,
+    [`${t.gitRepo}: ${isGit ? t.gitYes : t.gitNo}`],
+    additionalWorkingDirectories && additionalWorkingDirectories.length > 0
+      ? `${t.additionalDirs}:`
+      : null,
+    additionalWorkingDirectories && additionalWorkingDirectories.length > 0
+      ? additionalWorkingDirectories
+      : null,
+    `${t.platform}: ${env.platform}`,
+    `Shell: ${getShellInfoLine()}`,
+    `${t.osVersion}: ${unameSR}`,
+    modelLabel,
+    cutoff ? t.knowledgeCutoff(cutoff) : null,
+    undercover ? null : t.recentModels,
+    undercover ? null : t.availability,
+    undercover ? null : t.fastMode,
+  ].filter(item => item !== null)
 
-  const envItems = isZh
-    ? [
-        `主工作目录: ${cwd}`,
-        isWorktree
-          ? `这是一个git工作树——仓库的隔离副本。所有命令都从这个目录运行。不要\`cd\`到原始仓库根目录。`
-          : null,
-        [`是否为git仓库: ${isGit ? '是' : '否'}`],
-        additionalWorkingDirectories && additionalWorkingDirectories.length > 0
-          ? `额外工作目录:`
-          : null,
-        additionalWorkingDirectories && additionalWorkingDirectories.length > 0
-          ? additionalWorkingDirectories
-          : null,
-        `平台: ${env.platform}`,
-        `Shell: ${getShellInfoLine()}`,
-        `操作系统版本: ${unameSR}`,
-        modelDescription ? `你由 ${modelDescription} 模型驱动。` : null,
-        knowledgeCutoffMessage,
-        process.env.USER_TYPE === 'ant' && isUndercover()
-          ? null
-          : `最新的Claude模型系列是Claude 4.5/4.6。模型ID — Opus 4.7: '${CLAUDE_4_5_OR_4_6_MODEL_IDS.opus}', Sonnet 4.6: '${CLAUDE_4_5_OR_4_6_MODEL_IDS.sonnet}', Haiku 4.5: '${CLAUDE_4_5_OR_4_6_MODEL_IDS.haiku}'。构建AI应用时，默认使用最新、最强大的Claude模型。`,
-        process.env.USER_TYPE === 'ant' && isUndercover()
-          ? null
-          : `Claude Code可在终端CLI、桌面应用（Mac/Windows）、Web应用（claude.ai/code）和IDE扩展（VS Code、JetBrains）中使用。`,
-        process.env.USER_TYPE === 'ant' && isUndercover()
-          ? null
-          : `Claude Code的快速模式使用相同的${FRONTIER_MODEL_NAME}模型，但输出更快。它不会切换到不同的模型。可以通过 /fast 切换。`,
-      ].filter(item => item !== null)
-    : [
-        `Primary working directory: ${cwd}`,
-        isWorktree
-          ? `This is a git worktree — an isolated copy of the repository. Run all commands from this directory. Do NOT \`cd\` to the original repository root.`
-          : null,
-        [`Is a git repository: ${isGit}`],
-        additionalWorkingDirectories && additionalWorkingDirectories.length > 0
-          ? `Additional working directories:`
-          : null,
-        additionalWorkingDirectories && additionalWorkingDirectories.length > 0
-          ? additionalWorkingDirectories
-          : null,
-        `Platform: ${env.platform}`,
-        `Shell: ${getShellInfoLine()}`,
-        `OS Version: ${unameSR}`,
-        modelDescription
-          ? `You are powered by the model named ${modelDescription}. The exact model ID is ${modelId}.`
-          : null,
-        knowledgeCutoffMessage,
-        process.env.USER_TYPE === 'ant' && isUndercover()
-          ? null
-          : `The most recent Claude model family is Claude 4.5/4.6. Model IDs — Opus 4.7: '${CLAUDE_4_5_OR_4_6_MODEL_IDS.opus}', Sonnet 4.6: '${CLAUDE_4_5_OR_4_6_MODEL_IDS.sonnet}', Haiku 4.5: '${CLAUDE_4_5_OR_4_6_MODEL_IDS.haiku}'. When building AI applications, default to the latest and most capable Claude models.`,
-        process.env.USER_TYPE === 'ant' && isUndercover()
-          ? null
-          : `Claude Code is available as a CLI in the terminal, desktop app (Mac/Windows), web app (claude.ai/code), and IDE extensions (VS Code, JetBrains).`,
-        process.env.USER_TYPE === 'ant' && isUndercover()
-          ? null
-          : `Fast mode for Claude Code uses the same ${FRONTIER_MODEL_NAME} model with faster output. It does NOT switch to a different model. It can be toggled with /fast.`,
-      ].filter(item => item !== null)
-
-  return isZh
-    ? [
-        `# 环境信息`,
-        `你在以下环境中被调用：`,
-        ...prependBullets(envItems),
-      ].join(`\n`)
-    : [
-        `# Environment`,
-        `You have been invoked in the following environment: `,
-        ...prependBullets(envItems),
-      ].join(`\n`)
+  return `# ${t.envTitle}\n${t.envDesc}\n${prependBullets(envItems).join('\n')}`
 }
 
 // @[MODEL LAUNCH]: Add a knowledge cutoff date for the new model.
@@ -874,9 +920,10 @@ export function getUnameSR(): string {
   return `${osType()} ${osRelease()}`
 }
 
-export const DEFAULT_AGENT_PROMPT = shouldUseChinese()
-  ? `你是Claude Code的Agent，Anthropic官方的Claude CLI。根据用户的消息，你应该使用可用的工具来完成任务。完整地完成任务——不要过度设计，但也不要半途而废。完成任务后，用简洁的报告回复所做的事情和任何关键发现——调用者会将此传达给用户，所以只需要要点。`
-  : `You are an agent for Claude Code, Anthropic's official CLI for Claude. Given the user's message, you should use the tools available to complete the task. Complete the task fully—don't gold-plate, but don't leave it half-done. When you complete the task, respond with a concise report covering what was done and any key findings — the caller will relay this to the user, so it only needs the essentials.`
+export const DEFAULT_AGENT_PROMPT = localizedContent(
+  `你是Claude Code的Agent，Anthropic官方的Claude CLI。根据用户的消息，你应该使用可用的工具来完成任务。完整地完成任务——不要过度设计，但也不要半途而废。完成任务后，用简洁的报告回复所做的事情和任何关键发现——调用者会将此传达给用户，所以只需要要点。`,
+  `You are an agent for Claude Code, Anthropic's official CLI for Claude. Given the user's message, you should use the tools available to complete the task. Complete the task fully—don't gold-plate, but don't leave it half-done. When you complete the task, respond with a concise report covering what was done and any key findings — the caller will relay this to the user, so it only needs the essentials.`,
+)
 
 export async function enhanceSystemPromptWithEnvDetails(
   existingSystemPrompt: string[],
@@ -884,17 +931,18 @@ export async function enhanceSystemPromptWithEnvDetails(
   additionalWorkingDirectories?: string[],
   enabledToolNames?: ReadonlySet<string>,
 ): Promise<string[]> {
-  const notes = shouldUseChinese()
-    ? `注意事项：
+  const notes = localizedContent(
+    `注意事项：
 - Agent线程在bash调用之间总是重置其cwd，因此请只使用绝对文件路径。
 - 在你的最终回复中，分享与任务相关的文件路径（始终是绝对路径，不要相对路径）。只在精确文本至关重要时才包含代码片段（例如，你发现的bug、调用者要求的函数签名）——不要重复你只是读过的代码。
 - 为了与用户清晰沟通，助手必须避免使用表情符号。
-- 在工具调用之前不要使用冒号。像"让我读取文件："后跟一个读取工具调用应该只是"让我读取文件。"带句号。`
-    : `Notes:
+- 在工具调用之前不要使用冒号。像"让我读取文件："后跟一个读取工具调用应该只是"让我读取文件。"带句号。`,
+    `Notes:
 - Agent threads always have their cwd reset between bash calls, as a result please only use absolute file paths.
 - In your final response, share file paths (always absolute, never relative) that are relevant to the task. Include code snippets only when the exact text is load-bearing (e.g., a bug you found, a function signature the caller asked for) — do not recap code you merely read.
 - For clear communication with the user the assistant MUST avoid using emojis.
-- Do not use a colon before tool calls. Text like "Let me read the file:" followed by a read tool call should just be "Let me read the file." with a period.`
+- Do not use a colon before tool calls. Text like "Let me read the file:" followed by a read tool call should just be "Let me read the file." with a period.`,
+  )
   // Subagents get skill_discovery attachments (prefetch.ts runs in query(),
   // no agentId guard since #22830) but don't go through getSystemPrompt —
   // surface the same DiscoverSkills framing the main session gets. Gated on
@@ -928,8 +976,8 @@ export function getScratchpadInstructions(): string | null {
 
   const scratchpadDir = getScratchpadDir()
 
-  if (shouldUseChinese()) {
-    return `# 草稿纸目录
+  return localizedContent(
+    `# 草稿纸目录
 
 重要：始终使用此草稿纸目录存储临时文件，而不是 \`/tmp\` 或其他系统临时目录：
 \`${scratchpadDir}\`
@@ -943,10 +991,8 @@ export function getScratchpadInstructions(): string | null {
 
 只有在用户明确请求时才使用 \`/tmp\`。
 
-草稿纸目录是会话特定的，与用户项目隔离，可以自由使用而无需权限提示。`
-  }
-
-  return `# Scratchpad Directory
+草稿纸目录是会话特定的，与用户项目隔离，可以自由使用而无需权限提示。`,
+    `# Scratchpad Directory
 
 IMPORTANT: Always use this scratchpad directory for temporary files instead of \`/tmp\` or other system temp directories:
 \`${scratchpadDir}\`
@@ -960,7 +1006,8 @@ Use this directory for ALL temporary file needs:
 
 Only use \`/tmp\` if the user explicitly requests it.
 
-The scratchpad directory is session-specific, isolated from the user's project, and can be used freely without permission prompts.`
+The scratchpad directory is session-specific, isolated from the user's project, and can be used freely without permission prompts.`,
+  )
 }
 
 function getFunctionResultClearingSection(model: string): string | null {
@@ -979,20 +1026,20 @@ function getFunctionResultClearingSection(model: string): string | null {
     return null
   }
   
-  if (shouldUseChinese()) {
-    return `# 函数结果清理
+  return localizedContent(
+    `# 函数结果清理
 
-旧的工具结果将自动从上下文中清除以释放空间。最近的 ${config.keepRecent} 个结果始终保留。`
-  }
+旧的工具结果将自动从上下文中清除以释放空间。最近的 ${config.keepRecent} 个结果始终保留。`,
+    `# Function Result Clearing
 
-  return `# Function Result Clearing
-
-Old tool results will be automatically cleared from context to free up space. The ${config.keepRecent} most recent results are always kept.`
+Old tool results will be automatically cleared from context to free up space. The ${config.keepRecent} most recent results are always kept.`,
+  )
 }
 
-const SUMMARIZE_TOOL_RESULTS_SECTION = shouldUseChinese()
-  ? `处理工具结果时，将你以后可能需要的任何重要信息写入你的回复中，因为原始工具结果可能稍后会被清除。`
-  : `When working with tool results, write down any important information you might need later in your response, as the original tool result may be cleared later.`
+const SUMMARIZE_TOOL_RESULTS_SECTION = localizedContent(
+  `处理工具结果时，将你以后可能需要的任何重要信息写入你的回复中，因为原始工具结果可能稍后会被清除。`,
+  `When working with tool results, write down any important information you might need later in your response, as the original tool result may be cleared later.`,
+)
 
 function getBriefSection(): string | null {
   if (!(feature('KAIROS') || feature('KAIROS_BRIEF'))) return null

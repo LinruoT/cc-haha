@@ -297,6 +297,16 @@ export function formatResetText(
   return `${formatResetTime(Math.floor(dt.getTime() / 1000), showTimezone, showTime)}`
 }
 
+export function formatTimestamp(date: Date): string {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  const hours = String(date.getHours()).padStart(2, '0')
+  const minutes = String(date.getMinutes()).padStart(2, '0')
+  const seconds = String(date.getSeconds()).padStart(2, '0')
+  return `${year}-${month}-${day}-${hours}${minutes}${seconds}`
+}
+
 // Back-compat: truncate helpers moved to ./truncate.ts (needs ink/stringWidth)
 export {
   truncate,

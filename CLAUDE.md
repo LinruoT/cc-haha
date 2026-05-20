@@ -97,6 +97,7 @@ codesign --sign - --force --timestamp=none ./dist/claude-haha
 
 # 3. 链接到 PATH
 ln -sf /Users/billy/Documents/Personal/Dev/cc-haha/dist/claude-haha ~/.bun/bin/claude-haha
+ln -sf /Users/billy/Documents/Personal/Dev/cc-haha/dist/claude-haha ~/.local/bin/claude-haha
 
 # 4. 验证
 claude-haha --version

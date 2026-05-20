@@ -1397,6 +1397,7 @@ export const en = {
   'session.active': 'session active',
   'session.lastUpdated': 'last updated {time}',
   'session.messages': '{count} messages',
+  'session.jumpToMessage': 'Jump to message',
   'session.workspaceUnavailable': 'Workspace unavailable: {dir}',
   'session.timeJustNow': 'just now',
   'session.timeMinutes': '{n}m ago',

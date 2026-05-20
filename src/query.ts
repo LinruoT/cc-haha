@@ -101,6 +101,11 @@ import { applyToolResultBudget } from './utils/toolResultStorage.js'
 import { recordContentReplacement } from './utils/sessionStorage.js'
 import { handleStopHooks } from './query/stopHooks.js'
 import { evaluateThreadGoalAfterTurn } from './goals/goalEvaluator.js'
+import {
+  saveAssistantSummaryAsMarkdown,
+  isAssistantSummarySavingEnabled,
+  getLastAssistantText,
+} from './utils/saveAssistantSummary.js'
 import { buildQueryConfig } from './query/config.js'
 import { productionDeps, type QueryDeps } from './query/deps.js'
 import type { Terminal, Continue } from './query/transitions.js'
@@ -1265,6 +1270,15 @@ async function* queryLoop(
       if (lastMessage?.isApiErrorMessage) {
         void executeStopFailureHooks(lastMessage, toolUseContext)
         return { reason: 'completed' }
+      }
+
+      if (isAssistantSummarySavingEnabled()) {
+        const lastText = getLastAssistantText(assistantMessages)
+        if (lastText) {
+          void saveAssistantSummaryAsMarkdown(lastText).catch(
+            err => logForDebugging(`Failed to save assistant summary: ${err}`)
+          )
+        }
       }
 
       const stopHookResult = yield* handleStopHooks(

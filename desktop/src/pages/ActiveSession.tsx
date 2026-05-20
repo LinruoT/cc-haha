@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   SCHEDULED_TAB_ID,
   SETTINGS_TAB_ID,
@@ -18,7 +18,8 @@ import {
   useTerminalPanelStore,
 } from '../stores/terminalPanelStore'
 import { useTranslation } from '../i18n'
-import { MessageList } from '../components/chat/MessageList'
+import { MessageList, type MessageListHandle } from '../components/chat/MessageList'
+import { UserMessageJumpPopup } from '../components/chat/UserMessageJumpPopup'
 import { ChatInput } from '../components/chat/ChatInput'
 import { ComputerUsePermissionModal } from '../components/chat/ComputerUsePermissionModal'
 import { SessionTaskBar } from '../components/chat/SessionTaskBar'
@@ -228,6 +229,13 @@ export function ActiveSession() {
       : false,
   )
   const terminalPanelHeight = useTerminalPanelStore((state) => state.height)
+  const messageListRef = useRef<MessageListHandle>(null)
+  const [showJumpPopup, setShowJumpPopup] = useState(false)
+  const messageCountRef = useRef<HTMLDivElement>(null)
+
+  const handleJumpToMessage = useCallback((messageId: string) => {
+    messageListRef.current?.scrollToMessage(messageId)
+  }, [])
 
   useEffect(() => {
     if (activeTabId && !isMemberSession) {
@@ -404,7 +412,22 @@ export function ActiveSession() {
                       {!showWorkspacePanel && session?.messageCount !== undefined && session.messageCount > 0 && (
                         <>
                           <span className="text-[var(--color-outline)]">·</span>
-                          <span>{t('session.messages', { count: session.messageCount })}</span>
+                          <div ref={messageCountRef} className="relative">
+                            <button
+                              type="button"
+                              onClick={() => setShowJumpPopup(!showJumpPopup)}
+                              className="cursor-pointer underline decoration-[var(--color-outline)]/30 underline-offset-2 transition-colors hover:text-[var(--color-brand)] hover:decoration-[var(--color-brand)]/50"
+                            >
+                              {t('session.messages', { count: session.messageCount })}
+                            </button>
+                            <UserMessageJumpPopup
+                              open={showJumpPopup}
+                              onClose={() => setShowJumpPopup(false)}
+                              messages={sessionState?.messages ?? []}
+                              onJump={handleJumpToMessage}
+                              anchorRef={messageCountRef}
+                            />
+                          </div>
                         </>
                       )}
                     </div>
@@ -420,7 +443,7 @@ export function ActiveSession() {
                 </div>
               )}
 
-              <MessageList compact={showWorkspacePanel} />
+              <MessageList ref={messageListRef} compact={showWorkspacePanel} />
             </>
           )}
 
